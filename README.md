@@ -49,5 +49,5 @@ these guides reproduce it exactly.
 ## Status
 
 **Planning complete — guides authored one per session (see `INDEX.md`).**
-Guides **00**–**05** (foundation 00–04 + orchestration: Swarm/Consul/Nomad/Portainer)
-are ✅ done; **06–22** are planned.
+Guides **00**–**06** (foundation 00–04 + orchestration 05 + Kafka ecosystem 06)
+are ✅ done; **07–22** are planned.
