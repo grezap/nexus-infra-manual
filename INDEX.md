@@ -13,7 +13,7 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 02 | ✅ [Foundation · AD DS forest](./guides/02-foundation-ad-ds-forest.md) | `dc-nexus` Install-ADDSForest by hand (DNS, OUs, password policy, KDS root key); `dc-nexus-2` replica promotion (0.M) | 2 | ws2025 | `foundation` (dc-*) |
 | 03 | ✅ [Foundation · Vault HA](./guides/03-foundation-vault-ha.md) | `vault-1/2/3` 3-node **Raft** cluster (init, unseal, join, raft peers); `vault-transit` seal helper | 4 | deb13 | `security` (vault) |
 | 04 | ✅ [Foundation · Vault PKI + auto-unseal + LDAP](./guides/04-foundation-vault-pki-ldap.md) | **transit auto-unseal**; **PKI hierarchy** (root + intermediate CA); **LDAPS auth** + **secrets/ldap** rotation; the per-tier scaffolding pattern (PKI roles, AppRoles, KV) done by hand | — | — | `security` |
-| 05 | 📋 Orchestration · Swarm + Nomad + Consul + Portainer | Docker **Swarm** (3 mgr + 3 wkr), **Consul** (gossip+TLS+ACL), **Nomad** (mTLS+ACL+Vault), **Portainer** CE | 6 | deb13 | `nexus-infra-swarm-nomad` |
+| 05 | ✅ [Orchestration · Swarm + Nomad + Consul + Portainer](./guides/05-orchestration-swarm-nomad-consul-portainer.md) | Docker **Swarm** (3 mgr + 3 wkr), **Consul** (gossip+TLS+ACL), **Nomad** (mTLS+ACL+Vault), **Portainer** CE | 6 | deb13 | `nexus-infra-swarm-nomad` |
 | 06 | 📋 Kafka ecosystem | 2 **KRaft** clusters (east+west) mTLS, Schema Registry HA, REST Proxy, Kafka Connect (Debezium), ksqlDB, **MirrorMaker 2** DR | 15 | deb13 | `nexus-infra-kafka` |
 | 07 | 📋 OLTP · Redis Cluster | 6-node Redis Cluster (3 shards × 2 replicas) over mTLS | 6 | deb13 | `nexus-infra-oltp` |
 | 08 | 📋 OLTP · MongoDB replica set | 3-node RS, keyFile internal auth + mTLS x509 | 3 | deb13 | `nexus-infra-oltp` |
