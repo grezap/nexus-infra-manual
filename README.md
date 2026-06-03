@@ -49,4 +49,5 @@ these guides reproduce it exactly.
 ## Status
 
 **Planning complete — guides authored one per session (see `INDEX.md`).**
-Guide **00** (lab host + base VM + OS install) is ✅ done; **01–22** are planned.
+Guides **00** (lab host + base VM) and **01** (`nexus-gateway`) are ✅ done;
+**02–22** are planned.
