@@ -49,5 +49,5 @@ these guides reproduce it exactly.
 ## Status
 
 **Planning complete — guides authored one per session (see `INDEX.md`).**
-Guides **00** (lab host + base VM), **01** (`nexus-gateway`), **02** (AD DS
-forest), and **03** (Vault HA) are ✅ done; **04–22** are planned.
+Guides **00**–**04** (lab host + base VM, `nexus-gateway`, AD DS forest, Vault HA,
+Vault PKI + LDAP) are ✅ done; **05–22** are planned.
