@@ -1,0 +1,19 @@
+# Force LF for everything that executes or is parsed on the Linux VMs.
+# CRLF in a firstboot .sh (#!/bin/bash\r) or a TF-rendered heredoc breaks on
+# Linux; PowerShell on the build host reads LF fine. Guards against the
+# CR-injection class of bugs (see memory: pwsh->ssh stdin CR injection).
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.tf        text eol=lf
+*.hcl       text eol=lf
+*.cfg       text eol=lf
+*.j2        text eol=lf
+*.service   text eol=lf
+*.conf      text eol=lf
+preseed.cfg text eol=lf
+
+# PowerShell runs on the Windows build host; LF is fine for pwsh 7+.
+*.ps1       text eol=lf
