@@ -8,7 +8,7 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 
 | # | Guide | Scope (what you build by hand) | Nodes | OS | Mirrors |
 |:---:|---|---|:---:|---|---|
-| 00 | 📋 Lab host + base VM + OS install | VMware host networks **VMnet10** (backplane, host-only) + **VMnet11** (service); create a VM in the VMware GUI (vCPU/RAM/disk, 2 NICs); manual **Debian 13 netinst** walkthrough; manual **Windows Server 2025** install (for AD + SQL); per-node baseline (hostname, dual-NIC static/DHCP, SSH, nftables, chrony) | — | — | `deb13`/`ws2025`/`vault` Packer |
+| 00 | ✅ [Lab host + base VM + OS install](./guides/00-lab-host-and-base-vm.md) | VMware host networks **VMnet10** (backplane, host-only) + **VMnet11** (service); create a VM in the VMware GUI (vCPU/RAM/disk, 2 NICs); manual **Debian 13 netinst** walkthrough; manual **Windows Server 2025** install (for AD + SQL); per-node baseline (hostname, dual-NIC static/DHCP, SSH, nftables, chrony) | — | — | `deb13`/`ws2025`/`vault` Packer |
 | 01 | 📋 Foundation · nexus-gateway | Debian gateway: **dnsmasq** (DHCP reservations + DNS), **nftables** (NAT + filtering), **chrony** (NTP), **NFSv4** export, **iSCSI** target | 1 | deb13 | `nexus-infra-vmware/foundation` |
 | 02 | 📋 Foundation · AD DS forest | `dc-nexus` Install-ADDSForest by hand (DNS, OUs, password policy, KDS root key); `dc-nexus-2` replica promotion (0.M) | 2 | ws2025 | `foundation` (dc-*) |
 | 03 | 📋 Foundation · Vault HA | `vault-1/2/3` 3-node **Raft** cluster (init, unseal, join, raft peers); `vault-transit` seal helper | 4 | deb13 | `security` (vault) |
