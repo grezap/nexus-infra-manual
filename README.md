@@ -49,9 +49,10 @@ these guides reproduce it exactly.
 ## Status
 
 **Planning complete — guides authored one per session (see `INDEX.md`).**
-Guides **00**–**18** are ✅ done — foundation (00–04), orchestration (05),
+Guides **00**–**19** are ✅ done — foundation (00–04), orchestration (05),
 Kafka (06), the full **OLTP tier** (07–12), the full **Analytics tier**
-(13–15: ClickHouse + StarRocks shared-nothing + StarRocks shared-data), and the
+(13–15: ClickHouse + StarRocks shared-nothing + StarRocks shared-data), the
 full **Lakehouse tier** (16: MinIO object store; 17: Iceberg/Nessie REST catalog
-+ PG HA; 18: Spark HA + ZooKeeper — proving the Spark→Nessie→MinIO write path).
-**19–22** (Registry, Observability, Vitess, Citus) are planned.
++ PG HA; 18: Spark HA + ZooKeeper), and the **Registry** (19: Harbor HA + PG/Redis
+datastore + MinIO blobs + Trivy/cosign + Vault OIDC SSO).
+**20–22** (Observability, Vitess, Citus) are planned.
