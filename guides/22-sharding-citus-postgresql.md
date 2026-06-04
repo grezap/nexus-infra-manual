@@ -101,9 +101,10 @@ worker groups, with auto-failover at every tier.
 > **By-hand divergence:** read KV with `vault kv get` (no Vault Agent); issue certs
 > with the `vault` CLI from the **`citus-server`** PKI role. Certs in
 > `/etc/nexus-citus/tls/` (`server-cert.pem`/`server-key.pem`/`ca.pem`); the **PG
-> client key is `0600 postgres:postgres`** (T5). The etcd + Patroni-bring-up reuse the
-> patterns from **Guide 21 §5.3** (etcd mTLS) and **Guide 10** (Patroni); this guide
-> spells out the Citus-specific deltas.
+> client key is `0600 postgres:postgres`** (T5). The etcd DCS uses the same full-mTLS
+> pattern as Vitess's etcd (Guide 21) and Patroni is the same orchestrator as Guide
+> 10 — but **every command is written out in full here**; you don't need to open
+> those guides.
 
 ---
 
@@ -160,36 +161,98 @@ worker groups, with auto-failover at every tier.
 > ```
 > **VERIFY:** `vault read pki_int/roles/citus-server`; `dig @192.168.70.1 coord.citus.nexus.lab +short` → `.211`.
 
-> **Step 5.0.2 — Install + place a leaf cert on every node (the shared pattern)**
-> **WHERE:** issue on `vault-1`; place on each node.
-> **WHY:** every PG wire + etcd + Patroni REST connection is mTLS. Issue per host (CN
-> `<host>.citus.nexus.lab`, `alt_names` adding the **group VIP name** on the PG nodes —
-> e.g. `worker1.citus.nexus.lab` on `citus-worker1-*`, IP-SAN the VIP `.212`),
-> `ip_sans=<vmnet10>,<vmnet11>,127.0.0.1`. Split into `server-cert.pem` (leaf+int) /
-> `server-key.pem` / `ca.pem`. **etcd nodes** → `/etc/nexus-etcd/tls` (owner `etcd`);
-> **PG nodes** → `/etc/nexus-citus/tls` (owner `postgres`, **key `0600`** — T5). Same
-> by-hand issuance as Guides 16–21.
-> **WHAT (example — `citus-worker1-1`):**
+> **Step 5.0.2 — Issue + place a leaf cert on ALL 9 nodes**
+> **WHERE:** issue on `vault-1`; place on each of the 9 VMs.
+> **WHY:** every PG wire + etcd + Patroni REST connection is mTLS. The per-node
+> differences are in the table below. The 3 **etcd** nodes go to `/etc/nexus-etcd/tls`
+> (owner `etcd`); the 6 **PG** nodes go to `/etc/nexus-citus/tls` (owner `postgres`,
+> **key `0600`** — PG rejects a db-user key that's group/world-readable, T5). Each PG
+> node adds its **group VIP name + VIP IP** to the SANs (so the cert validates when a
+> client hits the floating VIP).
+>
+> | # | Node | VMnet11 | CN | extra `alt_names` / `ip_sans` VIP | cert dir | owner / key |
+> |---|---|---|---|---|---|---|
+> | 1 | `citus-etcd-1` | `.202` | `citus-etcd-1.citus.nexus.lab` | — / `192.168.10.202,192.168.70.202,127.0.0.1` | `/etc/nexus-etcd/tls` | `etcd:etcd` / `0640` |
+> | 2 | `citus-etcd-2` | `.203` | `citus-etcd-2.citus.nexus.lab` | — / `192.168.10.203,192.168.70.203,127.0.0.1` | `/etc/nexus-etcd/tls` | `etcd:etcd` / `0640` |
+> | 3 | `citus-etcd-3` | `.204` | `citus-etcd-3.citus.nexus.lab` | — / `192.168.10.204,192.168.70.204,127.0.0.1` | `/etc/nexus-etcd/tls` | `etcd:etcd` / `0640` |
+> | 4 | `citus-coord-1` | `.205` | `citus-coord-1.citus.nexus.lab` | `coord.citus.nexus.lab` / `192.168.10.205,192.168.70.205,192.168.70.211,127.0.0.1` | `/etc/nexus-citus/tls` | `postgres:postgres` / **`0600`** |
+> | 5 | `citus-coord-2` | `.206` | `citus-coord-2.citus.nexus.lab` | `coord.citus.nexus.lab` / `192.168.10.206,192.168.70.206,192.168.70.211,127.0.0.1` | `/etc/nexus-citus/tls` | `postgres:postgres` / **`0600`** |
+> | 6 | `citus-worker1-1` | `.207` | `citus-worker1-1.citus.nexus.lab` | `worker1.citus.nexus.lab` / `192.168.10.207,192.168.70.207,192.168.70.212,127.0.0.1` | `/etc/nexus-citus/tls` | `postgres:postgres` / **`0600`** |
+> | 7 | `citus-worker1-2` | `.208` | `citus-worker1-2.citus.nexus.lab` | `worker1.citus.nexus.lab` / `192.168.10.208,192.168.70.208,192.168.70.212,127.0.0.1` | `/etc/nexus-citus/tls` | `postgres:postgres` / **`0600`** |
+> | 8 | `citus-worker2-1` | `.209` | `citus-worker2-1.citus.nexus.lab` | `worker2.citus.nexus.lab` / `192.168.10.209,192.168.70.209,192.168.70.213,127.0.0.1` | `/etc/nexus-citus/tls` | `postgres:postgres` / **`0600`** |
+> | 9 | `citus-worker2-2` | `.210` | `citus-worker2-2.citus.nexus.lab` | `worker2.citus.nexus.lab` / `192.168.10.210,192.168.70.210,192.168.70.213,127.0.0.1` | `/etc/nexus-citus/tls` | `postgres:postgres` / **`0600`** |
+>
+> **WHAT — issuance, for EACH of the 9 (substitute CN + alt_names + ip_sans from the table):**
 > ```bash
+> # on vault-1 -- example: citus-worker1-1 (row 6). etcd rows have no VIP alt_name.
 > vault write -format=json pki_int/issue/citus-server \
 >   common_name=citus-worker1-1.citus.nexus.lab \
 >   alt_names='citus-worker1-1,citus-worker1-1.citus.nexus.lab,worker1.citus.nexus.lab,localhost' \
->   ip_sans='192.168.10.207,192.168.70.207,192.168.70.212,127.0.0.1' ttl=2160h > /tmp/w.json
-> # split -> /etc/nexus-citus/tls/{server-cert.pem, server-key.pem(0600 postgres), ca.pem}
+>   ip_sans='192.168.10.207,192.168.70.207,192.168.70.212,127.0.0.1' ttl=2160h > /tmp/citus-worker1-1.json
+> # an etcd row instead: alt_names='citus-etcd-1,citus-etcd-1.citus.nexus.lab,localhost' (no VIP)
+> vault read -field=certificate pki_int/cert/ca_chain > /tmp/nexus-ca-chain.pem
 > ```
-> **VERIFY:** `openssl x509 -in /etc/nexus-citus/tls/server-cert.pem -noout -ext subjectAltName`
-> → the group VIP name + IP; `stat -c '%a %U' /etc/nexus-citus/tls/server-key.pem` → `600 postgres`.
+> **WHAT — placement, on EACH node (set `D` + `OWN` + `KMODE` from the table):**
+> ```bash
+> # copy /tmp/<host>.json + /tmp/nexus-ca-chain.pem to the node, then as root:
+> D=/etc/nexus-citus/tls ; OWN=postgres:postgres ; KMODE=0600    # etcd nodes: D=/etc/nexus-etcd/tls OWN=etcd:etcd KMODE=0640
+> install -d -o ${OWN%:*} -g ${OWN#*:} -m 0750 "$D"
+> jq -r '.data.certificate' /tmp/<host>.json > /tmp/leaf.crt
+> jq -r '.data.issuing_ca'  /tmp/<host>.json > /tmp/int.crt
+> jq -r '.data.private_key' /tmp/<host>.json > /tmp/leaf.key
+> cat /tmp/leaf.crt /tmp/int.crt > "$D/server-cert.pem"
+> openssl pkcs8 -topk8 -nocrypt -in /tmp/leaf.key -out "$D/server-key.pem"
+> cp /tmp/nexus-ca-chain.pem "$D/ca.pem"
+> chown -R "$OWN" "$D" ; chmod 0644 "$D/server-cert.pem" "$D/ca.pem" ; chmod "$KMODE" "$D/server-key.pem"
+> rm -f /tmp/leaf.crt /tmp/int.crt /tmp/leaf.key /tmp/<host>.json
+> ```
+> **VERIFY (each node):** `sudo openssl x509 -in <D>/server-cert.pem -noout -ext subjectAltName`
+> → the CN (+ the group VIP name + VIP IP on PG nodes); on a PG node
+> `stat -c '%a %U' /etc/nexus-citus/tls/server-key.pem` → `600 postgres`.
 
 ### 5.1 — Install the two node types
 
 > **Step 5.1.1 — etcd DCS nodes (`.202–.204`)**
 > **WHERE:** `citus-etcd-1/2/3`, root shell.
-> **WHY:** etcd 3.5.16 — the Patroni store. Same as **Guide 21 §5.1.1** (etcd +
-> `nexus-etcdctl` wrapper); here the firstboot group is `citus` (create both `etcd` +
-> `citus` groups). Unit disabled.
-> **WHAT:** install etcd 3.5.16 + the wrapper as Guide 21 §5.1.1, with
-> `/etc/nexus-etcd/tls` + groups `etcd` + `citus`.
-> **VERIFY:** `etcd --version` → `3.5.16`.
+> **WHY:** etcd 3.5.16 is the Patroni store. The node needs **both** an `etcd` group
+> (owns the cert dir + runs the daemon) and a `citus` group (firstboot chowns the
+> node-identity to `citus`). Install the binary + an mTLS-preloaded `nexus-etcdctl`
+> wrapper; the unit stays disabled until §5.2.2 renders the config.
+> **WHAT (on each etcd node):**
+> ```bash
+> getent group citus >/dev/null || groupadd --system citus
+> getent group etcd >/dev/null  || groupadd --system etcd
+> getent passwd etcd >/dev/null || useradd --system --gid etcd --home-dir /var/lib/nexus-etcd --create-home --shell /usr/sbin/nologin etcd
+> curl -fSL https://github.com/etcd-io/etcd/releases/download/v3.5.16/etcd-v3.5.16-linux-amd64.tar.gz | tar xz -C /tmp
+> install -m0755 /tmp/etcd-v3.5.16-linux-amd64/etcd /tmp/etcd-v3.5.16-linux-amd64/etcdctl /usr/local/bin/
+> install -d -o etcd -g etcd -m0750 /var/lib/nexus-etcd /etc/nexus-etcd/tls
+> # mTLS-preloaded wrapper (reads /etc/nexus-etcd/endpoints, written in §5.2.2)
+> cat > /usr/local/sbin/nexus-etcdctl <<'EOS'
+> #!/bin/bash
+> exec /usr/local/bin/etcdctl --endpoints="$(cat /etc/nexus-etcd/endpoints)" \
+>   --cacert=/etc/nexus-etcd/tls/ca.pem --cert=/etc/nexus-etcd/tls/server-cert.pem --key=/etc/nexus-etcd/tls/server-key.pem "$@"
+> EOS
+> chmod 0755 /usr/local/sbin/nexus-etcdctl
+> # systemd unit (config-gated, disabled until §5.2.2)
+> cat > /etc/systemd/system/nexus-etcd.service <<'EOF'
+> [Unit]
+> Description=Nexus etcd (Citus Patroni DCS)
+> After=network-online.target
+> Wants=network-online.target
+> ConditionPathExists=/etc/nexus-etcd/etcd.conf.yml
+> [Service]
+> Type=notify
+> User=etcd
+> ExecStart=/usr/local/bin/etcd --config-file=/etc/nexus-etcd/etcd.conf.yml
+> Restart=on-failure
+> RestartSec=5
+> LimitNOFILE=65536
+> [Install]
+> WantedBy=multi-user.target
+> EOF
+> systemctl daemon-reload ; systemctl disable nexus-etcd 2>/dev/null || true
+> ```
+> **VERIFY:** `etcd --version` → `3.5.16`; `id etcd` + `getent group citus`.
 
 > **Step 5.1.2 — PG nodes (`.205–.210`): PostgreSQL 17 + Citus 14.1 + Patroni + keepalived**
 > **WHERE:** the 6 PG nodes, root shell.
@@ -264,10 +327,38 @@ worker groups, with auto-failover at every tier.
 
 > **Step 5.2.2 — Bring up the etcd DCS (3-member, full mTLS)**
 > **WHERE:** `citus-etcd-1/2/3`, root shell.
-> **WHY:** identical to **Guide 21 §5.3** — render `etcd.conf.yml` on all 3
-> (`initial-cluster` over the VMnet10 `.10.202–.204`, `client-cert-auth: true`), start
-> in parallel, verify a leader + an mTLS put/get. Token `nexus-citus-etcd`.
-> **VERIFY:** `nexus-etcdctl endpoint status --write-out=table` shows a leader.
+> **WHY:** render `etcd.conf.yml` on all 3 (each listens/advertises on its **VMnet10**
+> IP — matching the cert IP-SAN — so Patroni dials it by IP and avoids the hostname
+> self-dial trap), `client-cert-auth: true` (the cert is the authorization, no RBAC),
+> then start all 3 **close together** (Raft needs simultaneous start for the first
+> `initial-cluster-state: new` bootstrap) and verify a leader + an mTLS round-trip.
+> **WHAT (on each etcd node — set `NAME`/`SELF`/`CLIENT11` per node: `.202/.203/.204`):**
+> ```bash
+> NAME=citus-etcd-1 ; SELF=192.168.10.202 ; CLIENT11=192.168.70.202   # per node
+> cat > /etc/nexus-etcd/etcd.conf.yml <<EOF
+> name: $NAME
+> data-dir: /var/lib/nexus-etcd
+> listen-peer-urls: https://$SELF:2380
+> listen-client-urls: https://$SELF:2379,https://$CLIENT11:2379,https://127.0.0.1:2379
+> initial-advertise-peer-urls: https://$SELF:2380
+> advertise-client-urls: https://$SELF:2379
+> initial-cluster: citus-etcd-1=https://192.168.10.202:2380,citus-etcd-2=https://192.168.10.203:2380,citus-etcd-3=https://192.168.10.204:2380
+> initial-cluster-token: nexus-citus-etcd
+> initial-cluster-state: new
+> peer-transport-security:   { cert-file: /etc/nexus-etcd/tls/server-cert.pem, key-file: /etc/nexus-etcd/tls/server-key.pem, trusted-ca-file: /etc/nexus-etcd/tls/ca.pem, client-cert-auth: true }
+> client-transport-security: { cert-file: /etc/nexus-etcd/tls/server-cert.pem, key-file: /etc/nexus-etcd/tls/server-key.pem, trusted-ca-file: /etc/nexus-etcd/tls/ca.pem, client-cert-auth: true }
+> auto-compaction-mode: periodic
+> auto-compaction-retention: "1"
+> EOF
+> chown root:etcd /etc/nexus-etcd/etcd.conf.yml ; chmod 0640 /etc/nexus-etcd/etcd.conf.yml
+> printf 'https://192.168.10.202:2379,https://192.168.10.203:2379,https://192.168.10.204:2379' > /etc/nexus-etcd/endpoints
+> systemctl daemon-reload ; systemctl enable nexus-etcd
+> ```
+> Then **start all 3 close together**: on each node run
+> `systemctl reset-failed nexus-etcd; systemctl start nexus-etcd`.
+> **EXPECTED:** a leader is elected within a minute.
+> **VERIFY:** `nexus-etcdctl endpoint status --write-out=table` shows a leader;
+> `nexus-etcdctl put /nexus/x ok && nexus-etcdctl get /nexus/x` round-trips.
 
 ### 5.3 — Patroni: 3 HA groups over the shared etcd
 
