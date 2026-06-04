@@ -450,7 +450,9 @@ parallel cluster*, not a replacement.
 > $RP -e "CREATE DATABASE IF NOT EXISTS nexus_sd"
 > $RP -e "CREATE TABLE nexus_sd.events (event_id BIGINT, ts DATETIME, bucket INT, payload VARCHAR(64)) \
 >         DUPLICATE KEY(event_id) DISTRIBUTED BY HASH(event_id) BUCKETS 6"
-> $RP -e "INSERT INTO nexus_sd.events VALUES (1,'2026-06-04 00:00:00',1,'demo-1'),(2,'2026-06-04 00:00:01',2,'demo-2') /* … up to 200 … */"
+> # build a 200-row VALUES list with the shell, then INSERT it in one statement:
+> VALUES=$(for i in $(seq 1 200); do printf "(%d,'2026-06-04 00:00:00',%d,'demo-%d')," "$i" "$((i % 6))" "$i"; done | sed 's/,$//')
+> $RP -e "INSERT INTO nexus_sd.events VALUES $VALUES"
 > $RP -N -e "SELECT count(*) FROM nexus_sd.events"
 > ```
 > **EXPECTED:** the `count(*)` matches inserted.

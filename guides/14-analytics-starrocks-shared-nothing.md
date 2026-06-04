@@ -141,12 +141,14 @@ space.
 > tarball, S3). Both FE + BE binaries are in the one tarball.
 > **WHAT:**
 > ```bash
-> apt-get update -qq && apt-get install -y openjdk-21-jdk curl openssl
+> apt-get update -qq && apt-get install -y openjdk-21-jdk curl openssl jq
 > # JAVA_HOME (FE needs it; bake into the env)
 > echo 'JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64' >> /etc/environment
-> # Download to /var/tmp (NOT /tmp -- tmpfs ENOSPC). <fileUrl> from the portal API.
+> # Get the 3.5.17 download URL from the portal API (old public CDN 403s -- S1),
+> # then download to /var/tmp (NOT /tmp -- tmpfs ENOSPC on the 2.2 GB tarball -- S3):
+> URL=$(curl -fsSL 'https://releases.starrocks.io/api/v2/download?version=3.5.17&os=ubuntu&arch=amd64' | jq -r '.fileUrl')
 > cd /var/tmp
-> curl -fSL '<StarRocks-3.5.17-ubuntu-amd64 fileUrl from download.starrocks.io portal>' -o starrocks.tar.gz
+> curl -fSL "$URL" -o starrocks.tar.gz
 > tar xzf starrocks.tar.gz && rm starrocks.tar.gz
 > mv StarRocks-3.5.17-ubuntu-amd64 /opt/starrocks    # contains fe/ + be/
 > id starrocks >/dev/null 2>&1 || useradd --system -m -d /opt/starrocks -s /usr/sbin/nologin starrocks
@@ -206,16 +208,36 @@ space.
 > **Step 5.1.3 — nftables: backplane trust + service ports + MySQL client**
 > **WHERE:** each node, root shell.
 > **WHY:** FE↔BE + BDB-JE ride the backplane (trust VMnet10); the MySQL query
-> `:9030` + FE HTTP `:8030` are reachable on VMnet11.
-> **WHAT:** add to `/etc/nftables.conf` `chain input` (before `counter drop`):
+> `:9030` + FE HTTP `:8030` + BE web `:8040` are reachable on VMnet11. Apply the
+> full ruleset atomically with `nft -f`.
+> **WHAT (on each of the 6 nodes — one ruleset; opening a port a node doesn't use is harmless):**
+> ```bash
+> cat > /etc/nftables.conf <<'EOF'
+> #!/usr/sbin/nft -f
+> flush ruleset
+> table inet filter {
+>     chain input {
+>         type filter hook input priority 0; policy drop;
+>         iif "lo" accept
+>         ct state { established, related } accept
+>         ct state invalid drop
+>         ip protocol icmp accept
+>         ip6 nexthdr icmpv6 accept
+>         iifname "nic0" ip saddr 192.168.70.0/24 tcp dport 22   accept comment "SSH"
+>         iifname "nic0" ip saddr 192.168.70.0/24 tcp dport 9100 accept comment "node_exporter"
+>         iifname "nic1" ip saddr 192.168.10.0/24 accept comment "trusted cluster backplane (VMnet10) -- FE<->BE + BDB-JE"
+>         iifname "nic0" ip saddr 192.168.70.0/24 tcp dport { 9030, 8030, 8040 } accept comment "FE MySQL/HTTP + BE web (VMnet11)"
+>         counter drop
+>     }
+>     chain forward { type filter hook forward priority 0; policy drop; }
+>     chain output  { type filter hook output priority 0; policy accept; }
+> }
+> EOF
+> nft -f /etc/nftables.conf ; systemctl enable nftables 2>/dev/null || true
 > ```
-> iifname "nic1" ip saddr 192.168.10.0/24 accept comment "trusted cluster backplane (VMnet10)"
-> # FE: iifname "nic0" ip saddr 192.168.70.0/24 tcp dport { 9030, 8030 } accept
-> # BE: iifname "nic0" ip saddr 192.168.70.0/24 tcp dport 8040 accept   (web UI)
-> ```
-> Install `mariadb-client` (for `mysql`) on the build host or a node:
+> Also install the MySQL client where you'll run queries (the build host or a node):
 > `apt-get install -y mariadb-client`.
-> **VERIFY:** `nft list chain inet filter input | grep nic1`.
+> **VERIFY:** `nft list chain inet filter input | grep '192.168.10.0/24 accept'` (all 6).
 
 ### 5.2 — Per-node PKI certs
 
@@ -225,17 +247,50 @@ space.
 > FE/BE security here relies on the trusted backplane + nftables (SR's internal
 > protocol isn't full mTLS like ClickHouse, and the MySQL endpoint uses
 > `--skip-ssl`). Place at `/opt/starrocks/{fe,be}/conf/tls/` (or a node tls dir).
-> **WHAT (on vault-1):**
+> **WHAT (once, on `vault-1` — create the role):**
 > ```bash
+> export VAULT_ADDR=https://127.0.0.1:8200 VAULT_CACERT=$HOME/.nexus/vault-ca-bundle.crt
 > vault write pki_int/roles/starrocks-server \
 >   allowed_domains='nexus.lab,starrocks-fe.nexus.lab,sr-fe-leader,sr-fe-follower-1,sr-fe-follower-2,sr-be-1,sr-be-2,sr-be-3,localhost' \
 >   allow_subdomains=true allow_bare_domains=true allow_ip_sans=true enforce_hostnames=false \
 >   server_flag=true client_flag=true key_type=rsa key_bits=2048 ttl=2160h max_ttl=2160h
-> # per node: issue (CN=<host>.nexus.lab, FE nodes add starrocks-fe.nexus.lab,
-> #   ip_sans=<vmnet11>,<vmnet10>,127.0.0.1) -> server.crt/server.key/ca.crt
 > ```
-> **EXPECTED:** certs placed per node.
-> **VERIFY:** `sudo openssl x509 -in <tls-dir>/server.crt -noout -subject` → node CN.
+> Per-node values (FE nodes add the round-robin name `starrocks-fe.nexus.lab` to the SANs; BE nodes don't):
+>
+> | Node | VMnet11 | CN | `ip_sans` | cert dir |
+> |---|---|---|---|---|
+> | `sr-fe-leader` | `.31` | `sr-fe-leader.nexus.lab` | `192.168.10.31,192.168.70.31,127.0.0.1` | `/opt/starrocks/fe/conf/tls` |
+> | `sr-fe-follower-1` | `.32` | `sr-fe-follower-1.nexus.lab` | `192.168.10.32,192.168.70.32,127.0.0.1` | `/opt/starrocks/fe/conf/tls` |
+> | `sr-fe-follower-2` | `.33` | `sr-fe-follower-2.nexus.lab` | `192.168.10.33,192.168.70.33,127.0.0.1` | `/opt/starrocks/fe/conf/tls` |
+> | `sr-be-1` | `.34` | `sr-be-1.nexus.lab` | `192.168.10.34,192.168.70.34,127.0.0.1` | `/opt/starrocks/be/conf/tls` |
+> | `sr-be-2` | `.35` | `sr-be-2.nexus.lab` | `192.168.10.35,192.168.70.35,127.0.0.1` | `/opt/starrocks/be/conf/tls` |
+> | `sr-be-3` | `.36` | `sr-be-3.nexus.lab` | `192.168.10.36,192.168.70.36,127.0.0.1` | `/opt/starrocks/be/conf/tls` |
+>
+> **WHAT (issue on `vault-1` — example `sr-fe-leader`; FE rows add the RR name):**
+> ```bash
+> vault write -format=json pki_int/issue/starrocks-server \
+>   common_name=sr-fe-leader.nexus.lab \
+>   alt_names='sr-fe-leader,sr-fe-leader.nexus.lab,starrocks-fe.nexus.lab,localhost' \
+>   ip_sans='192.168.10.31,192.168.70.31,127.0.0.1' ttl=2160h > /tmp/sr-fe-leader.json
+> # a BE row instead: alt_names='sr-be-1,sr-be-1.nexus.lab,localhost' (no RR name)
+> vault read -field=certificate pki_int/cert/ca_chain > /tmp/nexus-ca-chain.pem
+> ```
+> **WHAT (place on each node — set `D` from the table's cert dir):**
+> ```bash
+> # copy /tmp/<host>.json + /tmp/nexus-ca-chain.pem to the node, then as root:
+> D=/opt/starrocks/fe/conf/tls          # BE nodes: D=/opt/starrocks/be/conf/tls
+> install -d -o starrocks -g starrocks -m0750 "$D"
+> jq -r '.data.certificate' /tmp/<host>.json > /tmp/leaf.crt
+> jq -r '.data.issuing_ca'  /tmp/<host>.json > /tmp/int.crt
+> jq -r '.data.private_key' /tmp/<host>.json > /tmp/leaf.key
+> cat /tmp/leaf.crt /tmp/int.crt > "$D/server.crt"
+> openssl pkcs8 -topk8 -nocrypt -in /tmp/leaf.key -out "$D/server.key"
+> cp /tmp/nexus-ca-chain.pem "$D/ca.crt"
+> chown -R starrocks:starrocks "$D" ; chmod 0644 "$D/server.crt" "$D/ca.crt" ; chmod 0640 "$D/server.key"
+> rm -f /tmp/leaf.crt /tmp/int.crt /tmp/leaf.key /tmp/<host>.json
+> ```
+> **EXPECTED:** the 3 cert files in each node's cert dir.
+> **VERIFY (each node):** `sudo openssl x509 -in $D/server.crt -noout -subject` → the node CN.
 
 ### 5.3 — Bring up the FE quorum (`--helper`)
 
@@ -351,8 +406,9 @@ space.
 > $RP -e "CREATE DATABASE IF NOT EXISTS nexus"
 > $RP -e "CREATE TABLE nexus.events (event_id BIGINT, ts DATETIME, bucket INT, payload VARCHAR(64)) \
 >         DUPLICATE KEY(event_id) DISTRIBUTED BY HASH(event_id) BUCKETS 6 PROPERTIES(\"replication_num\"=\"3\")"
-> # insert a few hundred rows (build the VALUES list however you like):
-> $RP -e "INSERT INTO nexus.events VALUES (1,'2026-06-04 00:00:00',1,'demo-1'),(2,'2026-06-04 00:00:01',2,'demo-2') /* … up to 200 … */"
+> # build a 200-row VALUES list with the shell, then INSERT it in one statement:
+> VALUES=$(for i in $(seq 1 200); do printf "(%d,'2026-06-04 00:00:00',%d,'demo-%d')," "$i" "$((i % 6))" "$i"; done | sed 's/,$//')
+> $RP -e "INSERT INTO nexus.events VALUES $VALUES"
 > $RP -N -e "SELECT count(*) FROM nexus.events"
 > $RP -e "SHOW CREATE TABLE nexus.events\G" | grep '"replication_num" = "3"'
 > ```
