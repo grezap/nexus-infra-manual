@@ -24,7 +24,7 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 13 | ✅ [Analytics · ClickHouse](./guides/13-analytics-clickhouse.md) | 3 shards × 2 replicas + 3-node ClickHouse Keeper | 9 | deb13 | `nexus-infra-analytics` |
 | 14 | ✅ [Analytics · StarRocks (shared-nothing)](./guides/14-analytics-starrocks-shared-nothing.md) | 3 FE (BDB-JE quorum) + 3 BE (tablet sharding/replication) | 6 | deb13 | `nexus-infra-analytics` |
 | 15 | ✅ [Analytics · StarRocks (shared-data)](./guides/15-analytics-starrocks-shared-data.md) | 3 FE + 2 CN on `run_mode=shared_data`, MinIO storage volume (needs Guide 16 first) | 5 | deb13 | `nexus-infra-analytics` |
-| 16 | 📋 Lakehouse · MinIO | 4-node distributed erasure-coded object store | 4 | deb13 | `nexus-infra-lakehouse` |
+| 16 | ✅ [Lakehouse · MinIO](./guides/16-lakehouse-minio.md) | 4-node distributed erasure-coded object store (S3 :9000, RR-DNS `minio.nexus.lab`, mTLS, dedicated data VMDK) — **unblocks Guide 15** | 4 | deb13 | `nexus-infra-lakehouse` |
 | 17 | 📋 Lakehouse · Iceberg / Nessie | Nessie REST catalog + PG master-replica HA (VRRP VIP) | 4 | deb13 | `nexus-infra-lakehouse` |
 | 18 | 📋 Lakehouse · Spark HA | 2 masters + ZooKeeper quorum + 3 workers | 8 | deb13 | `nexus-infra-lakehouse` |
 | 19 | 📋 Registry · Harbor HA | 2 stateless app nodes (RR-DNS) + PG/Redis HA datastore, MinIO blobs, Vault OIDC SSO | 4 | deb13 | `nexus-infra-registry` |
