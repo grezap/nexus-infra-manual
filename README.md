@@ -48,12 +48,12 @@ these guides reproduce it exactly.
 
 ## Status
 
-**Planning complete — guides authored one per session (see `INDEX.md`).**
-Guides **00**–**20** are ✅ done — foundation (00–04), orchestration (05),
-Kafka (06), the full **OLTP tier** (07–12), the full **Analytics tier**
-(13–15: ClickHouse + StarRocks shared-nothing + StarRocks shared-data), the
-full **Lakehouse tier** (16: MinIO object store; 17: Iceberg/Nessie REST catalog
-+ PG HA; 18: Spark HA + ZooKeeper), the **Registry** (19: Harbor HA), and the
-**Observability** tier (20: Grafana LGTM — Prometheus/Loki/Tempo/Grafana/OTel,
-14 nodes + 2 VRRP VIPs).
-**21–22** (Vitess, Citus — the sharding tiers) are planned.
+**✅ COMPLETE — all 23 guides authored (see `INDEX.md`).**
+Foundation (00–04), orchestration (05), Kafka (06), the full **OLTP tier**
+(07–12), the full **Analytics tier** (13–15: ClickHouse + StarRocks
+shared-nothing + StarRocks shared-data), the full **Lakehouse tier** (16: MinIO;
+17: Iceberg/Nessie + PG HA; 18: Spark HA + ZooKeeper), the **Registry** (19:
+Harbor HA), the **Observability** tier (20: Grafana LGTM — 14 nodes + 2 VRRP
+VIPs), and the two **Sharding** tiers (21: Vitess/MySQL; 22: Citus/PostgreSQL).
+The entire NexusPlatform infrastructure layer — host networking through database
+sharding — is now reproducible **entirely by hand**, one command at a time.

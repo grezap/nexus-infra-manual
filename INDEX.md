@@ -29,15 +29,15 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 18 | ✅ [Lakehouse · Spark HA](./guides/18-lakehouse-spark-ha.md) | 2 Spark masters (ZooKeeper-elected HA) + 3-node ZK quorum + 3 workers; Iceberg/S3 client — proves the Spark→Nessie→MinIO write path | 8 | deb13 | `nexus-infra-lakehouse` |
 | 19 | ✅ [Registry · Harbor HA](./guides/19-registry-harbor-ha.md) | 2 stateless Harbor app nodes (RR-DNS) + PG 17/Redis HA datastore (keepalived VRRP VIP `.119`), MinIO `s3://harbor` blobs, Trivy + cosign, Vault OIDC SSO | 4 | deb13 | `nexus-infra-registry` |
 | 20 | ✅ [Observability · Grafana LGTM](./guides/20-observability-grafana-lgtm.md) | Prometheus HA + Alertmanager mesh + Loki + Tempo (MinIO) + Grafana HA over shared PG + OTel Collector + fleet Vector; 2 VRRP VIPs (`.184/.185`) | 14 | deb13 | `nexus-infra-observability` |
-| 21 | 📋 Sharding · Vitess (MySQL) | 3 etcd + vtctld/VTOrc + 2 vtgate + 2 shards × 3 Percona tablets | 12 | deb13 | `nexus-infra-vitess` |
-| 22 | 📋 Sharding · Citus (PostgreSQL) | 3 etcd DCS + coordinator Patroni pair + 2 worker Patroni pairs + 3 keepalived VIPs | 9 | deb13 | `nexus-infra-citus` |
+| 21 | ✅ [Sharding · Vitess (MySQL)](./guides/21-sharding-vitess-mysql.md) | 3 etcd topo + vtctld/VTOrc + 2 vtgate + 2 shards × 3 Percona 8.4 tablets; hash-vindex sharding, full mTLS, VTOrc auto-reparent | 12 | deb13 | `nexus-infra-vitess` |
+| 22 | ✅ [Sharding · Citus (PostgreSQL)](./guides/22-sharding-citus-postgresql.md) | 3 etcd DCS + coordinator Patroni pair + 2 worker Patroni pairs + 3 keepalived VIPs (VIP-follows-leader); 32-shard distributed table, full mTLS | 9 | deb13 | `nexus-infra-citus` |
 
-**Total: 23 guides · ~140 VMs · the full infrastructure layer, by hand.**
+**Total: 23 guides · ~140 VMs · the full infrastructure layer, by hand. ✅ ALL 23 COMPLETE.**
 
 ## How we work
 
 - **One guide per session.** Each session produces one complete, self-reviewed guide
-  under `guides/NN-<slug>.md`, and flips its row above from 📋 → ✅.
+  under `guides/NN-<slug>.md`, and flips its row above from 📋 → ✅. **All 23 are now ✅.**
 - Every guide follows [`CONVENTIONS.md`](./CONVENTIONS.md) (the step-block format +
   global lab facts) so the format never drifts.
 - Commands + configs are sourced **verbatim from the automated repos** (the rendered
