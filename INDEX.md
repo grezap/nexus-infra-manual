@@ -21,7 +21,7 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 10 | ✅ [OLTP · Patroni PostgreSQL HA](./guides/10-oltp-patroni-postgresql-ha.md) | 3 Patroni + 3 etcd + 2 HAProxy + VRRP VIP | 8 | deb13 | `nexus-infra-oltp` |
 | 11 | ✅ [OLTP · SQL Server FCI + Always-On AG](./guides/11-oltp-sqlserver-fci-ag.md) | WSFC + iSCSI shared storage FCI + AG listener | 4 | ws2025 | `nexus-infra-oltp` |
 | 12 | ✅ [OLTP · MongoDB sharded](./guides/12-oltp-mongodb-sharded.md) | 3 config RS + 2 shard RS (×3) + 2 mongos | 11 | deb13 | `nexus-infra-oltp` |
-| 13 | 📋 Analytics · ClickHouse | 3 shards × 2 replicas + 3-node ClickHouse Keeper | 9 | deb13 | `nexus-infra-analytics` |
+| 13 | ✅ [Analytics · ClickHouse](./guides/13-analytics-clickhouse.md) | 3 shards × 2 replicas + 3-node ClickHouse Keeper | 9 | deb13 | `nexus-infra-analytics` |
 | 14 | 📋 Analytics · StarRocks (shared-nothing) | 3 FE (BDB-JE quorum) + 3 BE (tablet sharding/replication) | 6 | deb13 | `nexus-infra-analytics` |
 | 15 | 📋 Analytics · StarRocks (shared-data) | 3 FE + 2 CN on `run_mode=shared_data`, MinIO storage volume | 5 | deb13 | `nexus-infra-analytics` |
 | 16 | 📋 Lakehouse · MinIO | 4-node distributed erasure-coded object store | 4 | deb13 | `nexus-infra-lakehouse` |
