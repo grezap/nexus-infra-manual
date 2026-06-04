@@ -19,7 +19,7 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 08 | ✅ [OLTP · MongoDB replica set](./guides/08-oltp-mongodb-replica-set.md) | 3-node RS, keyFile internal auth + mTLS x509 | 3 | deb13 | `nexus-infra-oltp` |
 | 09 | ✅ [OLTP · Percona XtraDB Cluster](./guides/09-oltp-percona-xtradb-cluster.md) | 3 PXC (Galera) + 2 ProxySQL + **VRRP VIP** (keepalived) | 5 | deb13 | `nexus-infra-oltp` |
 | 10 | ✅ [OLTP · Patroni PostgreSQL HA](./guides/10-oltp-patroni-postgresql-ha.md) | 3 Patroni + 3 etcd + 2 HAProxy + VRRP VIP | 8 | deb13 | `nexus-infra-oltp` |
-| 11 | 📋 OLTP · SQL Server FCI + Always-On AG | WSFC + iSCSI shared storage FCI + AG listener | 4 | ws2025 | `nexus-infra-oltp` |
+| 11 | ✅ [OLTP · SQL Server FCI + Always-On AG](./guides/11-oltp-sqlserver-fci-ag.md) | WSFC + iSCSI shared storage FCI + AG listener | 4 | ws2025 | `nexus-infra-oltp` |
 | 12 | 📋 OLTP · MongoDB sharded | 3 config RS + 2 shard RS (×3) + 2 mongos | 11 | deb13 | `nexus-infra-oltp` |
 | 13 | 📋 Analytics · ClickHouse | 3 shards × 2 replicas + 3-node ClickHouse Keeper | 9 | deb13 | `nexus-infra-analytics` |
 | 14 | 📋 Analytics · StarRocks (shared-nothing) | 3 FE (BDB-JE quorum) + 3 BE (tablet sharding/replication) | 6 | deb13 | `nexus-infra-analytics` |
