@@ -22,7 +22,7 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 11 | ✅ [OLTP · SQL Server FCI + Always-On AG](./guides/11-oltp-sqlserver-fci-ag.md) | WSFC + iSCSI shared storage FCI + AG listener | 4 | ws2025 | `nexus-infra-oltp` |
 | 12 | ✅ [OLTP · MongoDB sharded](./guides/12-oltp-mongodb-sharded.md) | 3 config RS + 2 shard RS (×3) + 2 mongos | 11 | deb13 | `nexus-infra-oltp` |
 | 13 | ✅ [Analytics · ClickHouse](./guides/13-analytics-clickhouse.md) | 3 shards × 2 replicas + 3-node ClickHouse Keeper | 9 | deb13 | `nexus-infra-analytics` |
-| 14 | 📋 Analytics · StarRocks (shared-nothing) | 3 FE (BDB-JE quorum) + 3 BE (tablet sharding/replication) | 6 | deb13 | `nexus-infra-analytics` |
+| 14 | ✅ [Analytics · StarRocks (shared-nothing)](./guides/14-analytics-starrocks-shared-nothing.md) | 3 FE (BDB-JE quorum) + 3 BE (tablet sharding/replication) | 6 | deb13 | `nexus-infra-analytics` |
 | 15 | 📋 Analytics · StarRocks (shared-data) | 3 FE + 2 CN on `run_mode=shared_data`, MinIO storage volume | 5 | deb13 | `nexus-infra-analytics` |
 | 16 | 📋 Lakehouse · MinIO | 4-node distributed erasure-coded object store | 4 | deb13 | `nexus-infra-lakehouse` |
 | 17 | 📋 Lakehouse · Iceberg / Nessie | Nessie REST catalog + PG master-replica HA (VRRP VIP) | 4 | deb13 | `nexus-infra-lakehouse` |
