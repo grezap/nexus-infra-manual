@@ -103,8 +103,9 @@ tier's `node_exporter`, logs, and app traces land here.
 > with the `vault` CLI from the **`observability-server`** PKI role (its
 > `allowed_domains` covers all 14 hostnames + the 5 RR DNS names + the 2 VIP DNS +
 > localhost). Each service's TLS lands in its own `/etc/nexus-<svc>/tls/` (PKCS#8
-> keys). The Grafana PG HA pair is the **same pattern as Guide 17 §5.4 / Guide 19
-> §5.4** — referenced, not re-derived.
+> keys). The Grafana PG HA pair uses the same streaming-replication + keepalived-VIP
+> pattern as the catalog/registry PG pairs (Guides 17/19), and is **written out in
+> full in §5.4** — you don't need to open those guides.
 
 ---
 
@@ -206,27 +207,72 @@ tier's `node_exporter`, logs, and app traces land here.
 > **VERIFY:** `dig @192.168.70.1 prometheus.nexus.lab +short` → `.170` + `.171`;
 > `dig @192.168.70.1 grafana.nexus.lab +short` → `.184`.
 
-> **Step 5.0.3 — Issue + place a leaf cert on every obs node (the shared pattern)**
-> **WHERE:** issue on `vault-1`; place on each node.
-> **WHY:** every service serves HTTPS with a per-host leaf from `observability-server`.
-> Use the **same by-hand issuance as Guides 16–19** (`vault write -format=json
-> pki_int/issue/observability-server …` → split into `server.crt`/`server.key`
-> (PKCS#8)/`ca.crt`). SANs add the node's RR DNS / VIP name (e.g. loki nodes add
-> `loki.nexus.lab`; grafana-pg nodes add `grafana-db.nexus.lab` + IP-SAN `.185`).
-> Place under each role's `/etc/nexus-<svc>/tls/` (e.g. `/etc/nexus-prometheus/tls`,
-> `/etc/nexus-loki/tls`, …), owner `root:<svc-group>`, key `0640` (PG key **`0600`**).
-> Also drop the chain world-readable at `/etc/ssl/certs/obs-ca.pem`.
-> **WHAT (example — `loki-1`; repeat per node with that node's names/IPs):**
+> **Step 5.0.3 — Issue + place a leaf cert on ALL 14 obs nodes**
+> **WHERE:** issue on `vault-1`; place on each of the 14 VMs.
+> **WHY:** every service serves HTTPS with its own per-host leaf from the
+> `observability-server` role. The per-node differences (the extra SAN name, the IP
+> SANs, the cert dir, the owner, the key mode) are in the table below. Most keys are
+> `0640 root:<group>`; the **grafana-pg keys are `0600 postgres:postgres`** (PG
+> rejects a db-user key that's group/world-readable). The `prom` nodes run *two*
+> services, so their cert is placed into **both** `/etc/nexus-prometheus/tls` and
+> `/etc/nexus-alertmanager/tls`. Also drop the CA chain world-readable at
+> `/etc/ssl/certs/obs-ca.pem` on every node (for `nexusadmin --cacert` without sudo).
+>
+> | # | Node | VMnet11 | extra `alt_names` (RR/VIP names) | `ip_sans` | cert dir(s) | owner / key |
+> |---|---|---|---|---|---|---|
+> | 1 | `prom-1` | `.170` | `prometheus.nexus.lab,alertmanager.nexus.lab` | `192.168.10.170,192.168.70.170,127.0.0.1` | `/etc/nexus-prometheus/tls` **and** `/etc/nexus-alertmanager/tls` | `root:prometheus` / `0640` (AM copy `root:alertmanager`) |
+> | 2 | `prom-2` | `.171` | `prometheus.nexus.lab,alertmanager.nexus.lab` | `192.168.10.171,192.168.70.171,127.0.0.1` | `/etc/nexus-prometheus/tls` **and** `/etc/nexus-alertmanager/tls` | `root:prometheus` / `0640` |
+> | 3 | `loki-1` | `.172` | `loki.nexus.lab` | `192.168.10.172,192.168.70.172,127.0.0.1` | `/etc/nexus-loki/tls` | `root:loki` / `0640` |
+> | 4 | `loki-2` | `.173` | `loki.nexus.lab` | `192.168.10.173,192.168.70.173,127.0.0.1` | `/etc/nexus-loki/tls` | `root:loki` / `0640` |
+> | 5 | `loki-3` | `.174` | `loki.nexus.lab` | `192.168.10.174,192.168.70.174,127.0.0.1` | `/etc/nexus-loki/tls` | `root:loki` / `0640` |
+> | 6 | `tempo-1` | `.175` | `tempo.nexus.lab` | `192.168.10.175,192.168.70.175,127.0.0.1` | `/etc/nexus-tempo/tls` | `root:tempo` / `0640` |
+> | 7 | `tempo-2` | `.176` | `tempo.nexus.lab` | `192.168.10.176,192.168.70.176,127.0.0.1` | `/etc/nexus-tempo/tls` | `root:tempo` / `0640` |
+> | 8 | `tempo-3` | `.177` | `tempo.nexus.lab` | `192.168.10.177,192.168.70.177,127.0.0.1` | `/etc/nexus-tempo/tls` | `root:tempo` / `0640` |
+> | 9 | `grafana-1` | `.178` | `grafana.nexus.lab` | `192.168.10.178,192.168.70.178,192.168.70.184,127.0.0.1` | `/etc/nexus-grafana/tls` | `root:grafana` / `0640` |
+> | 10 | `grafana-2` | `.179` | `grafana.nexus.lab` | `192.168.10.179,192.168.70.179,192.168.70.184,127.0.0.1` | `/etc/nexus-grafana/tls` | `root:grafana` / `0640` |
+> | 11 | `grafana-pg-1` | `.180` | `grafana-db.nexus.lab` | `192.168.10.180,192.168.70.180,192.168.70.185,127.0.0.1` | `/etc/nexus-grafana-pg/tls` | `postgres:postgres` / **`0600`** |
+> | 12 | `grafana-pg-2` | `.181` | `grafana-db.nexus.lab` | `192.168.10.181,192.168.70.181,192.168.70.185,127.0.0.1` | `/etc/nexus-grafana-pg/tls` | `postgres:postgres` / **`0600`** |
+> | 13 | `otel-collector-1` | `.182` | `otel.nexus.lab` | `192.168.10.182,192.168.70.182,127.0.0.1` | `/etc/nexus-otel-collector/tls` | `root:otel` / `0640` |
+> | 14 | `otel-collector-2` | `.183` | `otel.nexus.lab` | `192.168.10.183,192.168.70.183,127.0.0.1` | `/etc/nexus-otel-collector/tls` | `root:otel` / `0640` |
+>
+> **WHAT — issuance, for EACH of the 14 (substitute CN=`<node>.nexus.lab` + the table's `alt_names`/`ip_sans`):**
 > ```bash
-> # on vault-1:
+> # on vault-1 -- example: loki-1 (row 3). Repeat per node from the table.
 > vault write -format=json pki_int/issue/observability-server \
 >   common_name=loki-1.nexus.lab \
 >   alt_names='loki-1,loki-1.nexus.lab,loki.nexus.lab,localhost' \
 >   ip_sans='192.168.10.172,192.168.70.172,127.0.0.1' ttl=2160h > /tmp/loki-1.json
-> # place on loki-1 (split leaf+intermediate -> server.crt; PKCS#8 -> server.key; chain -> ca.crt + /etc/ssl/certs/obs-ca.pem)
+> vault read -field=certificate pki_int/cert/ca_chain > /tmp/nexus-ca-chain.pem
 > ```
-> **VERIFY (each node):** `openssl x509 -in /etc/nexus-<svc>/tls/server.crt -noout -ext subjectAltName`
-> → the node's RR DNS / VIP name present.
+> **WHAT — placement, on EACH node (set `D` + `OWN` + `KMODE` from the table):**
+> ```bash
+> # copy /tmp/<host>.json + /tmp/nexus-ca-chain.pem to the node, then as root:
+> D=/etc/nexus-loki/tls ; OWN=root:loki ; KMODE=0640     # grafana-pg: OWN=postgres:postgres KMODE=0600
+> install -d -o ${OWN%:*} -g ${OWN#*:} -m 0750 "$D"
+> jq -r '.data.certificate' /tmp/<host>.json > /tmp/leaf.crt
+> jq -r '.data.issuing_ca'  /tmp/<host>.json > /tmp/int.crt
+> jq -r '.data.private_key' /tmp/<host>.json > /tmp/leaf.key
+> cat /tmp/leaf.crt /tmp/int.crt > "$D/server.crt"
+> openssl pkcs8 -topk8 -nocrypt -in /tmp/leaf.key -out "$D/server.key"
+> cp /tmp/nexus-ca-chain.pem "$D/ca.crt"
+> install -m 0644 -o root -g root /tmp/nexus-ca-chain.pem /etc/ssl/certs/obs-ca.pem
+> chown -R "$OWN" "$D" ; chmod 0644 "$D/server.crt" "$D/ca.crt" ; chmod "$KMODE" "$D/server.key"
+> rm -f /tmp/leaf.crt /tmp/int.crt /tmp/leaf.key /tmp/<host>.json
+> ```
+> **For the 2 `prom` nodes only:** after the above (into `/etc/nexus-prometheus/tls`),
+> copy the same three files into the Alertmanager dir too:
+> ```bash
+> install -d -o root -g alertmanager -m 0750 /etc/nexus-alertmanager/tls
+> cp /etc/nexus-prometheus/tls/{server.crt,server.key,ca.crt} /etc/nexus-alertmanager/tls/
+> chown root:alertmanager /etc/nexus-alertmanager/tls/{server.crt,server.key,ca.crt}
+> chmod 0644 /etc/nexus-alertmanager/tls/{server.crt,ca.crt} ; chmod 0640 /etc/nexus-alertmanager/tls/server.key
+> ```
+> **VERIFY (each node):** `sudo openssl x509 -in <D>/server.crt -noout -subject -ext subjectAltName`
+> → the node's CN + its extra SAN name (e.g. `grafana-db.nexus.lab` + `.185` on grafana-pg).
+>
+> ⏱ **Ordering:** the cert dirs are created by each service's §5.1+ install step, so
+> run a node's placement *after* its install (the `install -d` above also pre-creates
+> the dir if you do it earlier).
 
 ### 5.1 — Metrics: Prometheus HA + Alertmanager mesh (`prom-1/2`)
 
@@ -465,31 +511,168 @@ tier's `node_exporter`, logs, and app traces land here.
 
 ### 5.4 — Grafana state DB: PG 17 HA pair (`grafana-pg-1/2`, VIP `.185`)
 
-> **Step 5.4.1 — Build the PG master-replica pair (same as Guide 17/19 §5.4)**
-> **WHERE:** `grafana-pg-1` (primary) + `grafana-pg-2` (replica), root shell.
-> **WHY:** the dashboard state DB. Build it **exactly like Guide 17 §5.4 / Guide 19
-> §5.4** — PGDG install (bookworm fallback for `libicu72`/`libldap-2.5-0`), primary
-> conf.d + `pg_hba` + `repluser` + `grafana` role + `grafana` DB, replica
-> `pg_basebackup -R` (with `.pgpass`), keepalived VRRP VIP `.185` (`virtual_router_id
-> 85`, the versioned `pg_isready` check). ⚠️ **The replica must ALSO write the
-> `pg_hba.conf` replication block** — `pg_basebackup` copies the DATA dir but
-> `pg_hba.conf` lives in the CONFIG dir, so without this the promoted replica can't
-> accept the old primary as a standby after a failover (T24). The PG cert SAN includes
-> `grafana-db.nexus.lab` + IP-SAN `.185`.
-> **WHAT (deltas from Guide 17 §5.4 — the names):** DB `grafana`, role `grafana`,
-> conf.d `/etc/postgresql/17/main/conf.d/nexus-grafana.conf`, `pg_hba` marker
-> `NEXUS-GRAFANA-HBA`, VIP `.185`, KV `nexus/observability/grafana-pg/*`, cert dir
-> `/etc/nexus-grafana-pg/tls/`. Write the `NEXUS-GRAFANA-HBA` block on **both** nodes
-> (T24):
+> **Step 5.4.1 — Install PostgreSQL 17 + keepalived on both PG nodes (`.180/.181`)**
+> **WHERE:** `grafana-pg-1` + `grafana-pg-2`, root shell.
+> **WHY:** PG 17 from PGDG. Debian 13 (trixie) PGDG lags, so use the **bookworm**
+> PGDG repo + pull the two t64-renamed deps (`libicu72` + `libldap-2.5-0`) from a
+> low-pinned bookworm fallback. Units installed disabled — configured below.
+> **WHAT (run on both PG nodes):**
+> ```bash
+> apt-get install -y curl ca-certificates gnupg lsb-release keepalived
+> install -d -m 0755 /etc/apt/keyrings
+> curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor > /etc/apt/keyrings/pgdg.gpg
+> echo 'deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main' > /etc/apt/sources.list.d/pgdg.list
+> echo 'deb http://deb.debian.org/debian bookworm main' > /etc/apt/sources.list.d/bookworm-pg-deps.list
+> cat > /etc/apt/preferences.d/bookworm-pg-deps.pref <<'EOF'
+> Package: *
+> Pin: release n=bookworm
+> Pin-Priority: 100
+>
+> Package: libicu72 libldap-2.5-0
+> Pin: release n=bookworm
+> Pin-Priority: 990
+> EOF
+> apt-get update
+> apt-get install -y -t bookworm libicu72 libldap-2.5-0
+> apt-get install -y postgresql-17 postgresql-client-17 postgresql-contrib-17
+> systemctl disable --now postgresql postgresql@17-main keepalived 2>/dev/null || true
+> install -d -o root -g postgres -m 0750 /etc/nexus-grafana-pg /etc/nexus-grafana-pg/tls
 > ```
-> # NEXUS-GRAFANA-HBA  (on BOTH primary and replica)
+> (The PG cert for these nodes — `/etc/nexus-grafana-pg/tls/server.crt`/`server.key`
+> (**`0600` postgres**)/`ca.crt`, SAN `grafana-db.nexus.lab` + IP-SAN `.185` — is
+> placed by §5.0.3.)
+> **VERIFY:** `/usr/lib/postgresql/17/bin/postgres --version` → `17.x`; `keepalived --version`.
+
+> **Step 5.4.2 — Configure the PRIMARY (`grafana-pg-1`, `.180`)**
+> **WHERE:** `grafana-pg-1`, root shell with `VAULT_ADDR`/`VAULT_TOKEN` + CA.
+> **WHY:** enable replication + TLS, set `pg_hba` (replication over the backplane;
+> grafana + admin over VMnet11 TLS), create `repluser` + `grafana` roles + the
+> `grafana` DB. ⚠️ Write the `NEXUS-GRAFANA-HBA` block here AND on the replica (T24 —
+> `pg_basebackup` copies the DATA dir, not `pg_hba.conf` in the CONFIG dir, so the
+> replica needs its own copy to accept the old primary as a standby after failover).
+> **WHAT (on `grafana-pg-1`):**
+> ```bash
+> export VAULT_ADDR=https://192.168.70.121:8200 VAULT_CACERT=$HOME/.nexus/vault-ca-bundle.crt
+> SUPERPW=$(vault kv get -field=value nexus/observability/grafana-pg/superuser-password)
+> REPLPW=$(vault kv get -field=value nexus/observability/grafana-pg/replication-password)
+> GRAFPW=$(vault kv get -field=value nexus/observability/grafana-pg/grafana-db-password)
+> CONF=/etc/postgresql/17/main ; mkdir -p "$CONF/conf.d"
+> cat > "$CONF/conf.d/nexus-grafana.conf" <<'EOF'
+> listen_addresses = '*'
+> wal_level = replica
+> max_wal_senders = 10
+> max_replication_slots = 10
+> hot_standby = on
+> password_encryption = scram-sha-256
+> ssl = on
+> ssl_cert_file = '/etc/nexus-grafana-pg/tls/server.crt'
+> ssl_key_file = '/etc/nexus-grafana-pg/tls/server.key'
+> ssl_ca_file = '/etc/nexus-grafana-pg/tls/ca.crt'
+> EOF
+> grep -q "include_dir = 'conf.d'" "$CONF/postgresql.conf" || echo "include_dir = 'conf.d'" >> "$CONF/postgresql.conf"
+> grep -q 'NEXUS-GRAFANA-HBA' "$CONF/pg_hba.conf" || cat >> "$CONF/pg_hba.conf" <<'EOF'
+> # NEXUS-GRAFANA-HBA
 > host    replication   repluser   192.168.10.0/24   scram-sha-256
 > hostssl grafana       grafana    192.168.70.0/24   scram-sha-256
 > hostssl all           postgres   192.168.70.0/24   scram-sha-256
+> EOF
+> pg_ctlcluster 17 main start || systemctl start postgresql@17-main ; systemctl enable postgresql@17-main
+> for i in $(seq 1 30); do sudo -u postgres pg_isready -q && break; sleep 2; done
+> sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$SUPERPW'"
+> sudo -u postgres psql -c "CREATE ROLE repluser WITH REPLICATION LOGIN PASSWORD '$REPLPW'"
+> sudo -u postgres psql -c "CREATE ROLE grafana  WITH LOGIN PASSWORD '$GRAFPW'"
+> sudo -u postgres psql -c "CREATE DATABASE grafana OWNER grafana"
+> pg_ctlcluster 17 main reload || systemctl reload postgresql@17-main
 > ```
-> **VERIFY:** `psql -tAc "SELECT count(*) FROM pg_stat_replication"` → `1` (primary);
-> `pg_is_in_recovery()` → `t` (replica); VIP `.185` on exactly one node;
-> `psql -tAc "SELECT 1 FROM pg_database WHERE datname='grafana'"` → `1`.
+> **VERIFY:** `sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='grafana'"` → `1`.
+
+> **Step 5.4.3 — Clone the REPLICA (`grafana-pg-2`, `.181`)**
+> **WHERE:** `grafana-pg-2`, root shell with `VAULT_ADDR`/`VAULT_TOKEN` + CA.
+> **WHY:** write the standby's `conf.d` + the **same `NEXUS-GRAFANA-HBA` block** (T24)
+> + a `.pgpass` for the walreceiver, then `pg_basebackup -R` from the primary's
+> **backplane** IP `.10.180`.
+> **WHAT (on `grafana-pg-2`):**
+> ```bash
+> export VAULT_ADDR=https://192.168.70.121:8200 VAULT_CACERT=$HOME/.nexus/vault-ca-bundle.crt
+> REPLPW=$(vault kv get -field=value nexus/observability/grafana-pg/replication-password)
+> CONF=/etc/postgresql/17/main ; DATA=/var/lib/postgresql/17/main ; mkdir -p "$CONF/conf.d"
+> cat > "$CONF/conf.d/nexus-grafana.conf" <<'EOF'
+> listen_addresses = '*'
+> wal_level = replica
+> max_wal_senders = 10
+> max_replication_slots = 10
+> hot_standby = on
+> password_encryption = scram-sha-256
+> ssl = on
+> ssl_cert_file = '/etc/nexus-grafana-pg/tls/server.crt'
+> ssl_key_file = '/etc/nexus-grafana-pg/tls/server.key'
+> ssl_ca_file = '/etc/nexus-grafana-pg/tls/ca.crt'
+> EOF
+> grep -q "include_dir = 'conf.d'" "$CONF/postgresql.conf" || echo "include_dir = 'conf.d'" >> "$CONF/postgresql.conf"
+> grep -q 'NEXUS-GRAFANA-HBA' "$CONF/pg_hba.conf" || cat >> "$CONF/pg_hba.conf" <<'EOF'
+> # NEXUS-GRAFANA-HBA
+> host    replication   repluser   192.168.10.0/24   scram-sha-256
+> hostssl grafana       grafana    192.168.70.0/24   scram-sha-256
+> hostssl all           postgres   192.168.70.0/24   scram-sha-256
+> EOF
+> echo "192.168.10.180:5432:replication:repluser:$REPLPW" > /var/lib/postgresql/.pgpass
+> chown postgres:postgres /var/lib/postgresql/.pgpass ; chmod 0600 /var/lib/postgresql/.pgpass
+> pg_ctlcluster 17 main stop || systemctl stop postgresql@17-main
+> rm -rf "$DATA" ; install -d -m 0700 -o postgres -g postgres "$DATA"
+> sudo -u postgres env PGPASSWORD="$REPLPW" pg_basebackup -h 192.168.10.180 -p 5432 -U repluser -D "$DATA" -Fp -Xs -P -R
+> pg_ctlcluster 17 main start || systemctl start postgresql@17-main ; systemctl enable postgresql@17-main
+> ```
+> **VERIFY (replica):** `sudo -u postgres psql -tAc 'SELECT pg_is_in_recovery()'` → `t`;
+> **(primary):** `sudo -u postgres psql -tAc "SELECT count(*) FROM pg_stat_replication"` → `1`.
+
+> **Step 5.4.4 — keepalived VRRP VIP `.185` on both PG nodes**
+> **WHERE:** `grafana-pg-1` (priority 110) + `grafana-pg-2` (priority 100), root shell.
+> **WHY:** the floating DB front door `grafana-db.nexus.lab`. State `BACKUP` +
+> `nopreempt`; the health check execs the **versioned** `pg_isready` (not the
+> `/usr/bin` pg_wrapper symlink, which fails under keepalived's exec context);
+> `notify_master` promotes a standby on failover. VRRP `virtual_router_id 85`.
+> **WHAT (the check + promote scripts — identical on both nodes):**
+> ```bash
+> cat > /usr/local/sbin/nexus-grafana-pg-check.sh <<'EOS'
+> #!/bin/bash
+> exec /usr/lib/postgresql/17/bin/pg_isready -q -h 127.0.0.1 -p 5432
+> EOS
+> chmod 0755 /usr/local/sbin/nexus-grafana-pg-check.sh
+> cat > /etc/keepalived/nexus-grafana-pg-promote.sh <<'EOS'
+> #!/bin/bash
+> if sudo -u postgres psql -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | grep -qi t; then
+>   /usr/bin/pg_ctlcluster 17 main promote
+> fi
+> EOS
+> chmod 0755 /etc/keepalived/nexus-grafana-pg-promote.sh
+> ```
+> **WHAT (on `grafana-pg-1` — `priority 110`, `unicast_src_ip .180`, peer `.181`):**
+> ```bash
+> cat > /etc/keepalived/keepalived.conf <<'EOF'
+> global_defs { script_user root }
+> vrrp_script chk_pg { script "/usr/local/sbin/nexus-grafana-pg-check.sh" ; interval 5 ; fall 2 ; rise 2 }
+> vrrp_instance VI_GRAFANA_DB {
+>   state BACKUP
+>   nopreempt
+>   interface nic0
+>   virtual_router_id 85
+>   priority 110
+>   advert_int 1
+>   unicast_src_ip 192.168.70.180
+>   unicast_peer { 192.168.70.181 }
+>   authentication { auth_type PASS ; auth_pass grafdbvr }
+>   virtual_ipaddress { 192.168.70.185/24 dev nic0 }
+>   notify_master "/etc/keepalived/nexus-grafana-pg-promote.sh"
+>   track_script { chk_pg }
+> }
+> EOF
+> systemctl enable --now keepalived ; systemctl restart keepalived
+> ```
+> **WHAT (on `grafana-pg-2` — identical but `priority 100`, `unicast_src_ip
+> 192.168.70.181`, `unicast_peer { 192.168.70.180 }`).**
+> **EXPECTED:** the VIP binds on the primary (`.180`, higher priority).
+> **VERIFY:** `ip -4 -o addr show nic0 | grep 192.168.70.185` on **exactly one** PG node;
+> `dig @192.168.70.1 grafana-db.nexus.lab +short` → `.185`.
 
 ### 5.5 — Dashboards: Grafana HA over shared PG (`grafana-1/2`, VIP `.184`)
 
