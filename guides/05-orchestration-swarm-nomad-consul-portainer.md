@@ -378,10 +378,14 @@ spelled out below.
 > **Step 5.2.3 — Join `swarm-worker-1/2/3` as workers**
 > **WHERE:** wrk-1/2/3 (`.131/.132/.133`), root shell.
 > **WHY:** add the task-running capacity.
-> **WHAT (on each):**
+> **WHAT (run each line on the matching worker — `<WORKER_TOKEN>` is the worker token printed by `docker swarm join-token -q worker` in §5.2.1):**
 > ```bash
-> # wrk-1: --advertise-addr 192.168.10.131  | wrk-2: .132 | wrk-3: .133
-> docker swarm join --token <WORKER_TOKEN> --advertise-addr 192.168.10.13X 192.168.10.111:2377
+> # on wrk-1 (.131):
+> docker swarm join --token <WORKER_TOKEN> --advertise-addr 192.168.10.131 192.168.10.111:2377
+> # on wrk-2 (.132):
+> docker swarm join --token <WORKER_TOKEN> --advertise-addr 192.168.10.132 192.168.10.111:2377
+> # on wrk-3 (.133):
+> docker swarm join --token <WORKER_TOKEN> --advertise-addr 192.168.10.133 192.168.10.111:2377
 > ```
 > **EXPECTED:** "This node joined a swarm as a worker."
 > **VERIFY (on mgr-1):** `docker node ls` → **6 nodes**, all `Ready`/`Active`.
@@ -444,9 +448,11 @@ spelled out below.
 > **WHERE:** each of the 6 nodes, root shell; orchestrate from the build host.
 > **WHY:** encrypt the Serf gossip with the shared key from §5.3.1. Roll it one
 > node at a time so the cluster never loses quorum.
-> **WHAT (on each node, gossip key from `vault kv get`):**
+> **WHAT (on each node — fetch the shared gossip key from KV, write the drop-in):**
 > ```bash
-> printf 'encrypt = "%s"\n' '<GOSSIP_KEY>' > /etc/consul.d/10-encrypt.hcl
+> export VAULT_ADDR=https://192.168.70.121:8200 VAULT_CACERT=$HOME/.nexus/vault-ca-bundle.crt
+> GOSSIP=$(vault kv get -field=gossip_key nexus/swarm/consul-gossip-key)
+> printf 'encrypt = "%s"\n' "$GOSSIP" > /etc/consul.d/10-encrypt.hcl
 > chown consul:consul /etc/consul.d/10-encrypt.hcl ; chmod 640 /etc/consul.d/10-encrypt.hcl
 > systemctl restart consul ; sleep 5
 > ```

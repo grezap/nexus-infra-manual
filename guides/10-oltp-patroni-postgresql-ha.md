@@ -414,9 +414,21 @@ mechanism — this tier exercises the etcd-DCS + leader-lease model.
 >   nosync: false
 > EOF
 > chown postgres:postgres /etc/nexus-patroni/patroni.yml ; chmod 640 /etc/nexus-patroni/patroni.yml
+>
+> # The heredoc above wrote the file with <placeholders> (it used <<'EOF', so they
+> # stayed literal). Now fill in THIS node's name/IP + the 4 KV-seeded passwords:
+> export VAULT_ADDR=https://192.168.70.121:8200 VAULT_CACERT=$HOME/.nexus/vault-ca-bundle.crt
+> HOST=$(hostname) ; VM_IP=$(ip -4 -o addr show nic0 | awk '{print $4}' | cut -d/ -f1)
+> REST_PWD=$(vault kv get -field=password nexus/oltp/patroni/patroni-rest-password)
+> ETCD_PWD=$(vault kv get -field=password nexus/oltp/patroni/etcd-root-password)
+> SUPER_PWD=$(vault kv get -field=password nexus/oltp/patroni/postgres-superuser-password)
+> REPL_PWD=$(vault kv get -field=password nexus/oltp/patroni/postgres-replication-password)
+> sed -i "s|<host>|$HOST|g; s|<vm_ip>|$VM_IP|g; s|<PATRONI_REST_PWD>|$REST_PWD|g; s|<ETCD_ROOT_PWD>|$ETCD_PWD|g; s|<POSTGRES_SUPERUSER_PWD>|$SUPER_PWD|g; s|<POSTGRES_REPLICATION_PWD>|$REPL_PWD|g" /etc/nexus-patroni/patroni.yml
 > ```
-> **EXPECTED:** config on each node with its real name/IP + the secrets filled in.
-> **VERIFY:** `grep -E '^name:|connect_address' /etc/nexus-patroni/patroni.yml`.
+> **EXPECTED:** config on each node now has its real name/IP + the secrets filled in
+> (no `<...>` placeholders left).
+> **VERIFY:** `grep -E '^name:|connect_address' /etc/nexus-patroni/patroni.yml` (real
+> values); `grep -c '<' /etc/nexus-patroni/patroni.yml` → `0` (no placeholders remain).
 
 > **Step 5.4.2 — Start Patroni on all 3 in parallel + wait for 1 leader + 2 replicas**
 > **WHERE:** the 3 PG nodes (start together), then any one.
