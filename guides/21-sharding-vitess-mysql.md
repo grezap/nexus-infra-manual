@@ -151,23 +151,61 @@ physically lands across multiple shards, and VTOrc keeps each shard available.
 > ```
 > **VERIFY:** `vault read pki_int/roles/vitess-server`; `dig @192.168.70.1 vtgate.nexus.lab +short` → `.194` + `.195`.
 
-> **Step 5.0.2 — Install + place a leaf cert on every node (the shared pattern)**
-> **WHERE:** issue on `vault-1`; place on each node.
-> **WHY:** every component validates over mTLS. Issue per host (CN
-> `<host>.vitess.nexus.lab`, `alt_names` adding `vtgate.nexus.lab` on the vtgate nodes,
-> `ip_sans` = `<vmnet10>,<vmnet11>,127.0.0.1`) → split into `server-cert.pem` (leaf+int)
-> / `server-key.pem` (PKCS#8) / `ca.pem`. **etcd nodes** place under
-> `/etc/nexus-etcd/tls` (owner `etcd`); **all others** under `/etc/nexus-vitess/tls`
-> (owner `vitess`). Use the same by-hand issuance as Guides 16–20.
-> **WHAT (example — `vitess-shard1-tablet-1`):**
+> **Step 5.0.2 — Issue + place a leaf cert on ALL 12 nodes**
+> **WHERE:** issue on `vault-1`; place on each of the 12 VMs.
+> **WHY:** every component validates over mTLS, so **every one of the 12 nodes** gets
+> its own leaf cert (CN `<host>.vitess.nexus.lab`). The only per-node differences are
+> the IP SANs (that node's two IPs), the destination dir, and the owner — captured in
+> the table below. The 3 **etcd** nodes place certs in `/etc/nexus-etcd/tls` (owner
+> `etcd`, the user etcd runs as); the other 9 in `/etc/nexus-vitess/tls` (owner
+> `root:vitess`). Only the 2 **vtgate** nodes add `vtgate.nexus.lab` to the SANs (it's
+> the round-robin name clients hit).
+>
+> | # | Node | VMnet11 | CN | `ip_sans` | dest dir | owner |
+> |---|---|---|---|---|---|---|
+> | 1 | `vitess-etcd-1` | `.190` | `vitess-etcd-1.vitess.nexus.lab` | `192.168.10.190,192.168.70.190,127.0.0.1` | `/etc/nexus-etcd/tls` | `etcd:etcd` |
+> | 2 | `vitess-etcd-2` | `.191` | `vitess-etcd-2.vitess.nexus.lab` | `192.168.10.191,192.168.70.191,127.0.0.1` | `/etc/nexus-etcd/tls` | `etcd:etcd` |
+> | 3 | `vitess-etcd-3` | `.192` | `vitess-etcd-3.vitess.nexus.lab` | `192.168.10.192,192.168.70.192,127.0.0.1` | `/etc/nexus-etcd/tls` | `etcd:etcd` |
+> | 4 | `vitess-control-1` | `.193` | `vitess-control-1.vitess.nexus.lab` | `192.168.10.193,192.168.70.193,127.0.0.1` | `/etc/nexus-vitess/tls` | `root:vitess` |
+> | 5 | `vitess-vtgate-1` | `.194` | `vitess-vtgate-1.vitess.nexus.lab` | `192.168.10.194,192.168.70.194,127.0.0.1` | `/etc/nexus-vitess/tls` | `root:vitess` |
+> | 6 | `vitess-vtgate-2` | `.195` | `vitess-vtgate-2.vitess.nexus.lab` | `192.168.10.195,192.168.70.195,127.0.0.1` | `/etc/nexus-vitess/tls` | `root:vitess` |
+> | 7 | `vitess-shard1-tablet-1` | `.196` | `vitess-shard1-tablet-1.vitess.nexus.lab` | `192.168.10.196,192.168.70.196,127.0.0.1` | `/etc/nexus-vitess/tls` | `root:vitess` |
+> | 8 | `vitess-shard1-tablet-2` | `.197` | `vitess-shard1-tablet-2.vitess.nexus.lab` | `192.168.10.197,192.168.70.197,127.0.0.1` | `/etc/nexus-vitess/tls` | `root:vitess` |
+> | 9 | `vitess-shard1-tablet-3` | `.198` | `vitess-shard1-tablet-3.vitess.nexus.lab` | `192.168.10.198,192.168.70.198,127.0.0.1` | `/etc/nexus-vitess/tls` | `root:vitess` |
+> | 10 | `vitess-shard2-tablet-1` | `.199` | `vitess-shard2-tablet-1.vitess.nexus.lab` | `192.168.10.199,192.168.70.199,127.0.0.1` | `/etc/nexus-vitess/tls` | `root:vitess` |
+> | 11 | `vitess-shard2-tablet-2` | `.200` | `vitess-shard2-tablet-2.vitess.nexus.lab` | `192.168.10.200,192.168.70.200,127.0.0.1` | `/etc/nexus-vitess/tls` | `root:vitess` |
+> | 12 | `vitess-shard2-tablet-3` | `.201` | `vitess-shard2-tablet-3.vitess.nexus.lab` | `192.168.10.201,192.168.70.201,127.0.0.1` | `/etc/nexus-vitess/tls` | `root:vitess` |
+>
+> ⏱ **Ordering:** the `vault write` (issuance) can run now. The **placement** writes
+> into each node's tls dir, which that node's **§5.1 install step creates** — so run a
+> node's placement *after* its §5.1 step (or pre-create the dir here). Either way, all
+> 12 are done before §5.3 (etcd) needs them.
+> **WHAT — issuance, for EACH of the 12 (substitute CN + ip_sans from the table; only vtgate rows add `vtgate.nexus.lab`):**
 > ```bash
+> # on vault-1 -- example: vitess-shard1-tablet-1 (row 7). Repeat per node.
 > vault write -format=json pki_int/issue/vitess-server \
 >   common_name=vitess-shard1-tablet-1.vitess.nexus.lab \
 >   alt_names='vitess-shard1-tablet-1,vitess-shard1-tablet-1.vitess.nexus.lab,localhost' \
->   ip_sans='192.168.10.196,192.168.70.196,127.0.0.1' ttl=2160h > /tmp/t.json
-> # split -> /etc/nexus-vitess/tls/{server-cert.pem, server-key.pem(PKCS#8), ca.pem} owner root:vitess, key 0640
+>   ip_sans='192.168.10.196,192.168.70.196,127.0.0.1' ttl=2160h > /tmp/vitess-shard1-tablet-1.json
+> # a vtgate row instead would be:
+> #   alt_names='vitess-vtgate-1,vitess-vtgate-1.vitess.nexus.lab,vtgate.nexus.lab,localhost'
+> vault read -field=certificate pki_int/cert/ca_chain > /tmp/nexus-ca-chain.pem
 > ```
-> **VERIFY (each node):** `openssl x509 -in /etc/nexus-vitess/tls/server-cert.pem -noout -subject` → the host CN.
+> **WHAT — placement, on EACH node (set `D` + `OWN` from the table's dest dir + owner):**
+> ```bash
+> # copy /tmp/<host>.json + /tmp/nexus-ca-chain.pem to the node, then as root on the node:
+> D=/etc/nexus-vitess/tls ; OWN=root:vitess          # etcd nodes: D=/etc/nexus-etcd/tls ; OWN=etcd:etcd
+> jq -r '.data.certificate' /tmp/<host>.json > /tmp/leaf.crt
+> jq -r '.data.issuing_ca'  /tmp/<host>.json > /tmp/int.crt
+> jq -r '.data.private_key' /tmp/<host>.json > /tmp/leaf.key
+> cat /tmp/leaf.crt /tmp/int.crt > "$D/server-cert.pem"            # leaf + intermediate
+> openssl pkcs8 -topk8 -nocrypt -in /tmp/leaf.key -out "$D/server-key.pem"   # PKCS#8 key
+> cp /tmp/nexus-ca-chain.pem "$D/ca.pem"                           # the CA chain
+> chown -R $OWN "$D" ; chmod 0644 "$D/server-cert.pem" "$D/ca.pem" ; chmod 0640 "$D/server-key.pem"
+> rm -f /tmp/leaf.crt /tmp/int.crt /tmp/leaf.key /tmp/<host>.json
+> ```
+> **VERIFY (each of the 12 nodes):** `openssl x509 -in <D>/server-cert.pem -noout -subject -ext subjectAltName`
+> → the host's CN + its two IP SANs (and `vtgate.nexus.lab` on the 2 vtgate nodes).
 
 ### 5.1 — Install the three node types
 
