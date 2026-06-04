@@ -176,19 +176,58 @@ applied **`ON CLUSTER`** so it lands on every node at once via the macros
 > data certs to `/etc/clickhouse-server/tls/` — each as `server.crt`/`server.key`/
 > `ca.crt`. SANs must include the node FQDN + the round-robin name
 > `clickhouse.nexus.lab` (for the data nodes).
-> **WHAT (on vault-1):**
+> **WHAT (once, on `vault-1` — create the two roles):**
 > ```bash
+> export VAULT_ADDR=https://127.0.0.1:8200 VAULT_CACERT=$HOME/.nexus/vault-ca-bundle.crt
 > for role in clickhouse-keeper-server clickhouse-server; do
 >   vault write pki_int/roles/$role \
 >     allowed_domains='nexus.lab,clickhouse.nexus.lab,ch-keeper-1,ch-keeper-2,ch-keeper-3,ch-shard1-rep1,ch-shard1-rep2,ch-shard2-rep1,ch-shard2-rep2,ch-shard3-rep1,ch-shard3-rep2,localhost' \
 >     allow_subdomains=true allow_bare_domains=true allow_ip_sans=true enforce_hostnames=false \
 >     server_flag=true client_flag=true key_type=rsa key_bits=2048 ttl=2160h max_ttl=2160h
 > done
-> # per node: issue (CN=<host>.nexus.lab, alt_names add clickhouse.nexus.lab on data nodes,
-> #   ip_sans=<vmnet11>,<vmnet10>,127.0.0.1) -> server.crt / server.key / ca.crt (owned clickhouse, 0640)
+> ```
+> Per-node values (the 3 **keeper** nodes use the `clickhouse-keeper-server` role +
+> the keeper tls dir; the 6 **data** nodes use `clickhouse-server` + add the
+> round-robin name `clickhouse.nexus.lab` to the SANs):
+>
+> | Node | VMnet11 | PKI role | CN | extra `alt_names` | `ip_sans` | cert dir |
+> |---|---|---|---|---|---|---|
+> | `ch-keeper-1` | `.41` | `clickhouse-keeper-server` | `ch-keeper-1.nexus.lab` | — | `192.168.10.41,192.168.70.41,127.0.0.1` | `/etc/nexus-clickhouse-keeper/tls` |
+> | `ch-keeper-2` | `.42` | `clickhouse-keeper-server` | `ch-keeper-2.nexus.lab` | — | `192.168.10.42,192.168.70.42,127.0.0.1` | `/etc/nexus-clickhouse-keeper/tls` |
+> | `ch-keeper-3` | `.43` | `clickhouse-keeper-server` | `ch-keeper-3.nexus.lab` | — | `192.168.10.43,192.168.70.43,127.0.0.1` | `/etc/nexus-clickhouse-keeper/tls` |
+> | `ch-shard1-rep1` | `.44` | `clickhouse-server` | `ch-shard1-rep1.nexus.lab` | `clickhouse.nexus.lab` | `192.168.10.44,192.168.70.44,127.0.0.1` | `/etc/clickhouse-server/tls` |
+> | `ch-shard1-rep2` | `.45` | `clickhouse-server` | `ch-shard1-rep2.nexus.lab` | `clickhouse.nexus.lab` | `192.168.10.45,192.168.70.45,127.0.0.1` | `/etc/clickhouse-server/tls` |
+> | `ch-shard2-rep1` | `.46` | `clickhouse-server` | `ch-shard2-rep1.nexus.lab` | `clickhouse.nexus.lab` | `192.168.10.46,192.168.70.46,127.0.0.1` | `/etc/clickhouse-server/tls` |
+> | `ch-shard2-rep2` | `.47` | `clickhouse-server` | `ch-shard2-rep2.nexus.lab` | `clickhouse.nexus.lab` | `192.168.10.47,192.168.70.47,127.0.0.1` | `/etc/clickhouse-server/tls` |
+> | `ch-shard3-rep1` | `.48` | `clickhouse-server` | `ch-shard3-rep1.nexus.lab` | `clickhouse.nexus.lab` | `192.168.10.48,192.168.70.48,127.0.0.1` | `/etc/clickhouse-server/tls` |
+> | `ch-shard3-rep2` | `.49` | `clickhouse-server` | `ch-shard3-rep2.nexus.lab` | `clickhouse.nexus.lab` | `192.168.10.49,192.168.70.49,127.0.0.1` | `/etc/clickhouse-server/tls` |
+>
+> **WHAT (issue on `vault-1` — example `ch-shard1-rep1`, a data node; keeper rows use the keeper role + drop the RR name):**
+> ```bash
+> vault write -format=json pki_int/issue/clickhouse-server \
+>   common_name=ch-shard1-rep1.nexus.lab \
+>   alt_names='ch-shard1-rep1,ch-shard1-rep1.nexus.lab,clickhouse.nexus.lab,localhost' \
+>   ip_sans='192.168.10.44,192.168.70.44,127.0.0.1' ttl=2160h > /tmp/ch-shard1-rep1.json
+> # a keeper row instead:  vault write -format=json pki_int/issue/clickhouse-keeper-server \
+> #   common_name=ch-keeper-1.nexus.lab alt_names='ch-keeper-1,ch-keeper-1.nexus.lab,localhost' ip_sans='192.168.10.41,192.168.70.41,127.0.0.1' ...
+> vault read -field=certificate pki_int/cert/ca_chain > /tmp/nexus-ca-chain.pem
+> ```
+> **WHAT (place on each node — set `D` from the table's cert dir):**
+> ```bash
+> # copy /tmp/<host>.json + /tmp/nexus-ca-chain.pem to the node, then as root:
+> D=/etc/clickhouse-server/tls          # keeper nodes: D=/etc/nexus-clickhouse-keeper/tls
+> install -d -o clickhouse -g clickhouse -m 0750 "$D"
+> jq -r '.data.certificate' /tmp/<host>.json > /tmp/leaf.crt
+> jq -r '.data.issuing_ca'  /tmp/<host>.json > /tmp/int.crt
+> jq -r '.data.private_key' /tmp/<host>.json > /tmp/leaf.key
+> cat /tmp/leaf.crt /tmp/int.crt > "$D/server.crt"
+> openssl pkcs8 -topk8 -nocrypt -in /tmp/leaf.key -out "$D/server.key"
+> cp /tmp/nexus-ca-chain.pem "$D/ca.crt"
+> chown -R clickhouse:clickhouse "$D" ; chmod 0644 "$D/server.crt" "$D/ca.crt" ; chmod 0640 "$D/server.key"
+> rm -f /tmp/leaf.crt /tmp/int.crt /tmp/leaf.key /tmp/<host>.json
 > ```
 > **EXPECTED:** 3 cert files per node in the role's tls dir.
-> **VERIFY:** `sudo openssl x509 -in <tls-dir>/server.crt -noout -subject` → the node CN.
+> **VERIFY (each node):** `sudo openssl x509 -in $D/server.crt -noout -subject` → the node CN.
 
 ### 5.3 — Bring up the Keeper ensemble
 
