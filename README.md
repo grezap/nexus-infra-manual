@@ -49,6 +49,7 @@ these guides reproduce it exactly.
 ## Status
 
 **Planning complete — guides authored one per session (see `INDEX.md`).**
-Guides **00**–**11** (foundation 00–04 + orchestration 05 + Kafka 06 + OLTP
-Redis 07 / MongoDB 08 / Percona 09 / Patroni 10 / SQL Server FCI+AG 11) are ✅
-done; **12–22** are planned.
+Guides **00**–**12** are ✅ done — foundation (00–04), orchestration (05),
+Kafka (06), and the full **OLTP tier** (07–12: Redis, MongoDB RS, Percona,
+Patroni, SQL Server FCI+AG, MongoDB sharded). **13–22** (Analytics, Lakehouse,
+Registry, Observability, Vitess, Citus) are planned.
