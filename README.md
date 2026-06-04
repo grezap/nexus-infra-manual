@@ -49,5 +49,5 @@ these guides reproduce it exactly.
 ## Status
 
 **Planning complete — guides authored one per session (see `INDEX.md`).**
-Guides **00**–**06** (foundation 00–04 + orchestration 05 + Kafka ecosystem 06)
-are ✅ done; **07–22** are planned.
+Guides **00**–**07** (foundation 00–04 + orchestration 05 + Kafka 06 + OLTP Redis 07)
+are ✅ done; **08–22** are planned.

@@ -15,7 +15,7 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 04 | ✅ [Foundation · Vault PKI + auto-unseal + LDAP](./guides/04-foundation-vault-pki-ldap.md) | **transit auto-unseal**; **PKI hierarchy** (root + intermediate CA); **LDAPS auth** + **secrets/ldap** rotation; the per-tier scaffolding pattern (PKI roles, AppRoles, KV) done by hand | — | — | `security` |
 | 05 | ✅ [Orchestration · Swarm + Nomad + Consul + Portainer](./guides/05-orchestration-swarm-nomad-consul-portainer.md) | Docker **Swarm** (3 mgr + 3 wkr), **Consul** (gossip+TLS+ACL), **Nomad** (mTLS+ACL+Vault), **Portainer** CE | 6 | deb13 | `nexus-infra-swarm-nomad` |
 | 06 | ✅ [Kafka ecosystem](./guides/06-kafka-ecosystem.md) | 2 **KRaft** clusters (east+west) mTLS, Schema Registry HA, REST Proxy, Kafka Connect (Debezium), ksqlDB, **MirrorMaker 2** DR | 15 | deb13 | `nexus-infra-kafka` |
-| 07 | 📋 OLTP · Redis Cluster | 6-node Redis Cluster (3 shards × 2 replicas) over mTLS | 6 | deb13 | `nexus-infra-oltp` |
+| 07 | ✅ [OLTP · Redis Cluster](./guides/07-oltp-redis-cluster.md) | 6-node Redis Cluster (3 shards × 2 replicas) over mTLS | 6 | deb13 | `nexus-infra-oltp` |
 | 08 | 📋 OLTP · MongoDB replica set | 3-node RS, keyFile internal auth + mTLS x509 | 3 | deb13 | `nexus-infra-oltp` |
 | 09 | 📋 OLTP · Percona XtraDB Cluster | 3 PXC (Galera) + 2 ProxySQL + **VRRP VIP** (keepalived) | 5 | deb13 | `nexus-infra-oltp` |
 | 10 | 📋 OLTP · Patroni PostgreSQL HA | 3 Patroni + 3 etcd + 2 HAProxy + VRRP VIP | 8 | deb13 | `nexus-infra-oltp` |
