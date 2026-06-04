@@ -364,11 +364,12 @@ this is where the lab's images live, scanned and signed.
 
 > **Step 5.4.1 — Configure the PRIMARY (`registry-pg-1`): PG + Redis master**
 > **WHERE:** `registry-pg-1` (`.117`), root shell with `VAULT_ADDR`/`VAULT_TOKEN` + CA.
-> **WHY:** the PG half is **identical to Guide 17 §5.4.1** (conf.d with
-> `wal_level=replica` + SSL; `pg_hba` for replication over the backplane + harbor/admin
-> over VMnet11 TLS; `repluser` role + the `harbor` role + the **`registry`** DB). Plus
-> a **Redis master** (requirepass, bind `0.0.0.0`).
-> **WHAT (PG — substitute the registry names; see Guide 17 §5.4.1 for the full conf.d/pg_hba):**
+> **WHY:** standard PostgreSQL streaming-replication setup (the same shape used by
+> the catalog PG in Guide 17, but everything is spelled out here): a `conf.d`
+> drop-in (`wal_level=replica` + SSL), a `pg_hba` block (replication over the
+> backplane + harbor/admin over VMnet11 TLS), the `repluser` + `harbor` roles, and
+> the **`registry`** database. Plus a **Redis master** (requirepass, bind `0.0.0.0`).
+> **WHAT (PG primary — the full `conf.d`, `pg_hba`, roles + DB are all inlined here):**
 > ```bash
 > export VAULT_ADDR=https://192.168.70.121:8200 VAULT_CACERT=/etc/ssl/certs/registry-ca.pem
 > SUPERPW=$(vault kv get -field=value nexus/registry/pg-superuser-password)
@@ -424,10 +425,12 @@ this is where the lab's images live, scanned and signed.
 
 > **Step 5.4.2 — Clone the REPLICA (`registry-pg-2`): PG standby + Redis replica**
 > **WHERE:** `registry-pg-2` (`.118`), root shell.
-> **WHY:** PG half = **Guide 17 §5.4.2** (`.pgpass` for the walreceiver — T6 there —
-> + `pg_basebackup -R` from the primary's backplane IP `.10.117`). Plus a **Redis
+> **WHY:** clone the primary into a hot standby — write the standby's `conf.d` (same
+> as the primary's), a `.pgpass` so the walreceiver can authenticate (`pg_basebackup
+> -R` does **not** embed the replication password in `primary_conninfo`), then
+> `pg_basebackup -R` from the primary's **backplane** IP `.10.117`. Plus a **Redis
 > replica** (`replicaof <primary-backplane> 6379`).
-> **WHAT (Redis replica config, then PG basebackup as Guide 17 §5.4.2):**
+> **WHAT (Redis replica config, then the PG standby — all inlined):**
 > ```bash
 > export VAULT_ADDR=https://192.168.70.121:8200 VAULT_CACERT=/etc/ssl/certs/registry-ca.pem
 > REDISPW=$(vault kv get -field=value nexus/registry/redis-password)
@@ -444,11 +447,24 @@ this is where the lab's images live, scanned and signed.
 > EOF
 > grep -q 'nexus-registry-redis.conf' /etc/redis/redis.conf || echo "include /etc/redis/nexus-registry-redis.conf" >> /etc/redis/redis.conf
 > systemctl enable redis-server ; systemctl restart redis-server
-> # then the PG standby (Guide 17 §5.4.2): conf.d + .pgpass (repluser) + pg_basebackup -R from 192.168.10.117
+> # PG standby: write the same conf.d as the primary, a .pgpass for the walreceiver, then pg_basebackup
 > REPLPW=$(vault kv get -field=value nexus/registry/pg-replication-password)
+> CONF=/etc/postgresql/17/main ; mkdir -p "$CONF/conf.d"
+> cat > "$CONF/conf.d/nexus-registry.conf" <<'EOF'
+> listen_addresses = '*'
+> wal_level = replica
+> max_wal_senders = 10
+> max_replication_slots = 10
+> hot_standby = on
+> password_encryption = scram-sha-256
+> ssl = on
+> ssl_cert_file = '/etc/nexus-registry-pg/tls/server.crt'
+> ssl_key_file = '/etc/nexus-registry-pg/tls/server.key'
+> ssl_ca_file = '/etc/nexus-registry-pg/tls/ca.crt'
+> EOF
+> grep -q "include_dir = 'conf.d'" "$CONF/postgresql.conf" || echo "include_dir = 'conf.d'" >> "$CONF/postgresql.conf"
 > echo "192.168.10.117:5432:replication:repluser:$REPLPW" > /var/lib/postgresql/.pgpass
 > chown postgres:postgres /var/lib/postgresql/.pgpass ; chmod 0600 /var/lib/postgresql/.pgpass
-> # (write the same conf.d/nexus-registry.conf as 5.4.1, then:)
 > pg_ctlcluster 17 main stop || systemctl stop postgresql@17-main
 > rm -rf /var/lib/postgresql/17/main ; install -d -m 0700 -o postgres -g postgres /var/lib/postgresql/17/main
 > sudo -u postgres env PGPASSWORD="$REPLPW" pg_basebackup -h 192.168.10.117 -p 5432 -U repluser -D /var/lib/postgresql/17/main -Fp -Xs -P -R
@@ -652,19 +668,31 @@ this is where the lab's images live, scanned and signed.
 > **WHERE:** `registry-1` (capture) → `registry-2` (`.116`) (render/install).
 > **WHY:** HA requires **identical** `/data/secret` across app nodes (the secretkey +
 > CSRF + registry http.secret + jobservice secret) — else a token minted by one is
-> rejected by the other. Copy the seed, then install registry-2 with the same
-> `harbor.yml`.
-> **WHAT:**
+> rejected by the other. So: capture registry-1's `/data/secret`, restore it on
+> registry-2, then install registry-2 with the **same** `harbor.yml`. ✅ **registry-2's
+> `harbor.yml` is byte-for-byte identical to registry-1's** — there are *no*
+> node-specific values in it (it uses the round-robin `hostname: registry.nexus.lab`
+> and the external DB/Redis/S3 endpoints, which are the same from either node). So you
+> literally re-run the §5.5.2 render block on registry-2, unchanged.
+> **WHAT — do these four things in order:**
 > ```bash
-> # on registry-1: capture /data/secret
+> # 1. On registry-1: capture /data/secret (the shared HA secrets) to the build host.
 > ssh nexusadmin@192.168.70.115 'sudo tar czf - -C /data secret | base64 -w0' > /tmp/secret.b64
-> # on registry-2: render the SAME harbor.yml (repeat §5.5.2 render block), restore the secret, install
+>
+> # 2. On registry-2: start docker + create /data.
 > ssh nexusadmin@192.168.70.116 'sudo systemctl enable --now docker; sudo mkdir -p /data'
+>
+> # 3. On registry-2: restore the captured /data/secret.
 > cat /tmp/secret.b64 | ssh nexusadmin@192.168.70.116 'base64 -d | sudo tar xzf - -C /data'
-> # then on registry-2: render harbor.yml exactly as §5.5.2, then:  cd /opt/harbor && sudo ./install.sh --with-trivy
+> ```
+> ```bash
+> # 4. SSH to registry-2 (192.168.70.116), become root, and run the ENTIRE §5.5.2
+> #    render block verbatim (read the KV creds, write the identical /opt/harbor/harbor.yml,
+> #    write /data/secret/keys/secretkey), then install:
+> cd /opt/harbor && ./install.sh --with-trivy 2>&1 | tail -25
 > ```
 > **EXPECTED:** registry-2's stack comes up with the shared secrets.
-> **VERIFY (on registry-2):** `curl -fsS -k https://localhost/api/v2.0/health` → `healthy`.
+> **VERIFY (on registry-2):** `curl -fsS -k https://localhost/api/v2.0/health | grep -o '"status":"healthy"'` → `healthy`.
 
 > **Step 5.5.4 — Configure Vault OIDC SSO via the Harbor API**
 > **WHERE:** `registry-1` (against the front door), root shell.
