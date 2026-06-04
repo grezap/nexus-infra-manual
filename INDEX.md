@@ -17,7 +17,7 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 06 | ✅ [Kafka ecosystem](./guides/06-kafka-ecosystem.md) | 2 **KRaft** clusters (east+west) mTLS, Schema Registry HA, REST Proxy, Kafka Connect (Debezium), ksqlDB, **MirrorMaker 2** DR | 15 | deb13 | `nexus-infra-kafka` |
 | 07 | ✅ [OLTP · Redis Cluster](./guides/07-oltp-redis-cluster.md) | 6-node Redis Cluster (3 shards × 2 replicas) over mTLS | 6 | deb13 | `nexus-infra-oltp` |
 | 08 | ✅ [OLTP · MongoDB replica set](./guides/08-oltp-mongodb-replica-set.md) | 3-node RS, keyFile internal auth + mTLS x509 | 3 | deb13 | `nexus-infra-oltp` |
-| 09 | 📋 OLTP · Percona XtraDB Cluster | 3 PXC (Galera) + 2 ProxySQL + **VRRP VIP** (keepalived) | 5 | deb13 | `nexus-infra-oltp` |
+| 09 | ✅ [OLTP · Percona XtraDB Cluster](./guides/09-oltp-percona-xtradb-cluster.md) | 3 PXC (Galera) + 2 ProxySQL + **VRRP VIP** (keepalived) | 5 | deb13 | `nexus-infra-oltp` |
 | 10 | 📋 OLTP · Patroni PostgreSQL HA | 3 Patroni + 3 etcd + 2 HAProxy + VRRP VIP | 8 | deb13 | `nexus-infra-oltp` |
 | 11 | 📋 OLTP · SQL Server FCI + Always-On AG | WSFC + iSCSI shared storage FCI + AG listener | 4 | ws2025 | `nexus-infra-oltp` |
 | 12 | 📋 OLTP · MongoDB sharded | 3 config RS + 2 shard RS (×3) + 2 mongos | 11 | deb13 | `nexus-infra-oltp` |

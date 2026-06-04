@@ -49,5 +49,5 @@ these guides reproduce it exactly.
 ## Status
 
 **Planning complete — guides authored one per session (see `INDEX.md`).**
-Guides **00**–**08** (foundation 00–04 + orchestration 05 + Kafka 06 + OLTP Redis 07
-+ OLTP MongoDB 08) are ✅ done; **09–22** are planned.
+Guides **00**–**09** (foundation 00–04 + orchestration 05 + Kafka 06 + OLTP
+Redis 07 / MongoDB 08 / Percona 09) are ✅ done; **10–22** are planned.
