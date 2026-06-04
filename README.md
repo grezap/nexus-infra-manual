@@ -49,9 +49,9 @@ these guides reproduce it exactly.
 ## Status
 
 **Planning complete — guides authored one per session (see `INDEX.md`).**
-Guides **00**–**16** are ✅ done — foundation (00–04), orchestration (05),
+Guides **00**–**17** are ✅ done — foundation (00–04), orchestration (05),
 Kafka (06), the full **OLTP tier** (07–12), the full **Analytics tier**
 (13–15: ClickHouse + StarRocks shared-nothing + StarRocks shared-data), and the
-first **Lakehouse** guide (16: MinIO — the distributed erasure-coded object store
-that unblocks Guide 15 and backs Iceberg/Spark/Harbor/Loki/Tempo).
-**17–22** (rest of Lakehouse, Registry, Observability, Vitess, Citus) are planned.
+**Lakehouse** tier so far (16: MinIO erasure-coded object store; 17:
+Iceberg/Nessie REST catalog + dedicated PG master-replica HA).
+**18–22** (Spark, Registry, Observability, Vitess, Citus) are planned.
