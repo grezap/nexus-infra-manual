@@ -49,7 +49,7 @@ these guides reproduce it exactly.
 ## Status
 
 **Planning complete — guides authored one per session (see `INDEX.md`).**
-Guides **00**–**14** are ✅ done — foundation (00–04), orchestration (05),
-Kafka (06), the full **OLTP tier** (07–12), and **Analytics** ClickHouse (13) +
-StarRocks shared-nothing (14). **15–22** (StarRocks shared-data, Lakehouse,
-Registry, Observability, Vitess, Citus) are planned.
+Guides **00**–**15** are ✅ done — foundation (00–04), orchestration (05),
+Kafka (06), the full **OLTP tier** (07–12), and the full **Analytics tier**
+(13–15: ClickHouse + StarRocks shared-nothing + StarRocks shared-data).
+**16–22** (Lakehouse, Registry, Observability, Vitess, Citus) are planned.
