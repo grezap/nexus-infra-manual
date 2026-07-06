@@ -504,7 +504,31 @@ in.
 > **EXPECTED:** a ~5–10 min run ending in success, then an **automatic reboot**.
 > **VERIFY (after reboot):** on `dc-nexus-2`,
 > `Get-ADDomain | Format-List Forest, DomainMode, NetBIOSName` → `nexus.lab`.
-> Then add its DNS to point at itself: `Set-DnsClientServerAddress -InterfaceAlias 'nic0' -ServerAddresses '127.0.0.1','192.168.70.240'`.
+
+> **Step 5.8.1a — Pin `dc-nexus-2` to STATIC DNS (partner + self) — MANDATORY**
+> **WHERE:** `dc-nexus-2` console, elevated PowerShell.
+> **WHY:** a replica DC **must** use static DNS: the partner DC as **preferred**
+> and itself (loopback) as **alternate**. `dc-nexus-2` boots with DHCP DNS (the
+> gateway `.1`, which does **not** serve `nexus.lab`), so post-promotion it can't
+> resolve the partner's `<dsa-guid>._msdcs.nexus.lab` CNAME → AD replication
+> **fails with error 8524** ("DNS lookup failure") and the directory silently
+> **diverges** whenever `dc-nexus-2` has been offline (it is normally OFF in the
+> base-6 fleet). This is the canonical fix baked into the automated foundation
+> terraform (`role-overlay-dc-nexus-2-promotion.tf` step 6.5, 2026-07-06). Order
+> matters: **preferred = `.240` (partner), alternate = `127.0.0.1` (self)**.
+> **WHAT:**
+> ```powershell
+> $a = (Get-NetIPAddress -IPAddress '192.168.70.242').InterfaceAlias
+> Set-DnsClientServerAddress -InterfaceAlias $a -ServerAddresses '192.168.70.240','127.0.0.1'
+> Clear-DnsClientCache
+> ipconfig /registerdns
+> repadmin /syncall /AdeP        # force a full replication sync both ways
+> (Get-DnsClientServerAddress -InterfaceAlias $a -AddressFamily IPv4).ServerAddresses
+> ```
+> **EXPECTED:** DNS servers = `192.168.70.240, 127.0.0.1`; `repadmin /syncall`
+> reports success, no 8524.
+> **VERIFY:** `Get-DnsClientServerAddress` shows the static pair (not the gateway
+> `.1`); `repadmin /showrepl` (next step) is clean.
 
 > **Step 5.8.2 — Verify replication health (both directions)**
 > **WHERE:** `dc-nexus` console, elevated PowerShell.
@@ -589,6 +613,7 @@ foreach ($vm in 'dc-nexus-2','dc-nexus') {
 | Replica promotion "succeeds" but `dc-nexus-2` stays a Member Server | `-ReplicationSourceDC` got a non-resolvable value (the automated M1 bug: a literal `'dc-nexus.${domain}'`) | Pass a **literal FQDN** `'dc-nexus.nexus.lab'` (§5.8.1). |
 | `Add-Computer` on `dc-nexus-2` fails to find the domain | `dc-nexus-2`'s DNS doesn't point at the DC, or the gateway forward is missing | Set DNS to `192.168.70.240` (§5.1.2) and add the gateway forward (§5.1.1). |
 | `repadmin /showrepl` shows replication failures | First cycle hasn't run, or time skew between DCs | Wait ~1–5 min; confirm both DCs' clocks agree (PDC time, §5.5.2). |
+| Replication **error 8524** ("DNS lookup failure") after `dc-nexus-2` has been offline; directory silently diverges | `dc-nexus-2` reverted to **DHCP DNS** (gateway `.1`, which doesn't serve `nexus.lab`) → can't resolve the partner's `_msdcs.nexus.lab` CNAME | Pin **static DNS** (preferred `192.168.70.240` / alternate `127.0.0.1`), `ipconfig /registerdns`, then `repadmin /syncall /AdeP` (§5.8.1a). This is the canonical 2026-07-06 fix. |
 | Domain logons fail intermittently across the fleet | Clock skew > 5 min (Kerberos) | Ensure the PDC time config (§5.5.2) is healthy and members inherit it. |
 
 ---

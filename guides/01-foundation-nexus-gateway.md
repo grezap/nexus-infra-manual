@@ -753,7 +753,16 @@ follow that for screen-by-screen detail. The gateway-specific answers:
 > [ -f /srv/iscsi/sql-fci-shared.img ] || { truncate -s 60G /srv/iscsi/sql-fci-shared.img; chmod 0640 /srv/iscsi/sql-fci-shared.img; }
 >
 > CHAP_USER=sql-fci-initiator
-> CHAP_SECRET=$(openssl rand -hex 16)   # record this — Guide 11 needs it
+> # IDEMPOTENT: reuse the existing CHAP secret if the target is already
+> # configured. Re-running this step must NOT rotate the secret — Guide 11's
+> # SQL FCI initiator stores it and would fail CHAP auth after a silent
+> # rotation. Only generate a fresh secret on the FIRST run. (The automated lab
+> # sources this from Vault KV `nexus/oltp/sqlserver/iscsi-chap-secret` via a
+> # sticky sidecar; the by-hand equivalent is reuse-from-existing-config.)
+> if [ -f /etc/tgt/conf.d/sql-fci.conf ]; then
+>   CHAP_SECRET=$(awk '/incominguser/ {print $3}' /etc/tgt/conf.d/sql-fci.conf)
+> fi
+> CHAP_SECRET=${CHAP_SECRET:-$(openssl rand -hex 16)}   # record on FIRST run — Guide 11 needs it (≥12 chars, RFC 3720)
 > echo "iSCSI CHAP: user=$CHAP_USER secret=$CHAP_SECRET"
 >
 > cat > /etc/tgt/conf.d/sql-fci.conf <<EOF

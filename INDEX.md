@@ -32,7 +32,14 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 21 | ✅ [Sharding · Vitess (MySQL)](./guides/21-sharding-vitess-mysql.md) | 3 etcd topo + vtctld/VTOrc + 2 vtgate + 2 shards × 3 Percona 8.4 tablets; hash-vindex sharding, full mTLS, VTOrc auto-reparent | 12 | deb13 | `nexus-infra-vitess` |
 | 22 | ✅ [Sharding · Citus (PostgreSQL)](./guides/22-sharding-citus-postgresql.md) | 3 etcd DCS + coordinator Patroni pair + 2 worker Patroni pairs + 3 keepalived VIPs (VIP-follows-leader); 32-shard distributed table, full mTLS | 9 | deb13 | `nexus-infra-citus` |
 
-**Total: 23 guides · ~140 VMs · the full infrastructure layer, by hand. ✅ ALL 23 COMPLETE.**
+**Total: 23 guides · 140 VMs · the full infrastructure layer, by hand. ✅ ALL 23 COMPLETE.**
+
+> ⚠️ **One out-of-numeric-order dependency:** build **Guide 16 (MinIO) BEFORE Guide 15
+> (StarRocks shared-data)** — 15's `run_mode=shared_data` stores its data in a MinIO
+> bucket, so MinIO must already be **alive**. The rows are numbered by tier, not by this
+> single cross-tier edge. The full dependency graph — including which prerequisite tiers
+> must be *running* (not just built) when you start a guide — is in
+> [`OVERVIEW.md`](./OVERVIEW.md).
 
 ## How we work
 

@@ -198,6 +198,12 @@ spelled out below.
 > retry_join = ["192.168.10.111","192.168.10.112","192.168.10.113"]
 > connect { enabled = true }
 > performance { raft_multiplier = 1 }
+> # Allow servers to rejoin an intact raft that has been OFFLINE past the
+> # default 168h/7d (server_rejoin_age_max). This lab is normally powered off
+> # between sessions; without this a bring-up more than a week later leaves all
+> # 3 servers stuck `activating` (they refuse to rejoin their own old raft) and
+> # `nexus status swarm` masks it (it reads docker, not consul). 8760h = 1 year.
+> server_rejoin_age_max = "8760h"
 > EOF
 > chown consul:consul /etc/consul.d/consul.hcl ; chmod 640 /etc/consul.d/consul.hcl
 > ```
@@ -823,6 +829,7 @@ record belong to Guide 01 — leave them unless wiping that too.
 | After `nft -f`, Swarm/Portainer ports unreachable | `nft -f` atomically drops Docker's iptables-nft tables | `systemctl restart docker` after **every** `nft -f` (per `feedback_nftables_flush_ruleset_wipes_docker`). |
 | `host:9443` reachable on the manager but not from the build host | `inet filter forward` policy=drop with no `docker_gwbridge` accepts | Add the `forward`-chain accepts (§5.1.5) + restart docker. |
 | Consul still serves `:8500` after the TLS drop-in | HCL config-dir merge does NOT override `ports.http` from `consul.hcl` | Use the systemd `-http-port=-1` CLI flag drop-in (§5.4.2). See `feedback_consul_hcl_ports_merge_no_override`. |
+| After a **>7-day** power-off, all 3 Consul servers stuck `activating`; cluster never forms (but `nexus status swarm` looks fine — it reads docker, not consul) | Consul refuses to rejoin a raft offline past `server_rejoin_age_max` (default **168h/7d**) | Set `server_rejoin_age_max = "8760h"` in `consul.hcl` (§5.1.3) and restart consul — the servers rejoin their **own intact raft** (ACL state preserved). **Do NOT wipe the data dir** (orphans the ACL bootstrap). See `feedback_swarm_consul_rejoin_age_freeze`. |
 | Nomad drop-in (`tls.hcl`/`acl.hcl`) seems ignored | stock unit uses `-config=/etc/nomad.d/nomad.hcl` (single file) | Unit must use `-config=/etc/nomad.d/` (directory). §5.1.4 / `feedback_nomad_systemd_unit_single_file_config`. |
 | Nomad Raft can't elect after enabling TLS | sequential restart isolated the first TLS node from plain peers | Restart **all servers in parallel** (§5.5.1). `feedback_nomad_tls_rolling_restart_must_be_parallel`. |
 | Nomad won't boot: "too many colons in address" | `consul.address` has an `https://` scheme | Use scheme-less `127.0.0.1:8501` + `ssl = true` (§5.5.3). `feedback_nomad_consul_address_scheme_less`. |

@@ -484,20 +484,49 @@ install). The screens below are the interactive equivalents of the automated
 > **EXPECTED:** clock configured.
 > **VERIFY:** post-boot `timedatectl` shows `Time zone: UTC`.
 
-> **Step B.2.5 — Partition the whole disk (atomic, ext4, swap on)**
+> **Step B.2.5 — Partition the whole disk (single ext4 root, NO swap partition — growable root)**
 > **WHERE:** `vault-1` console.
-> **WHY:** matches the preseed `partman-auto` *atomic* recipe — one ext4 root +
-> swap on the single 10 GB disk. Simple, predictable, fine for a workload base.
+> **WHY:** the automated preseed uses the `atomic` recipe with
+> `partman-basicfilesystems/no_swap = true` → the disk becomes **one ext4 root
+> partition and no swap partition**. This is deliberate. A swap partition placed
+> *after* root (partman's default) makes root **not** the last partition, so
+> `growpart /dev/sda 1` cannot extend it after a disk grow — `nexus scale-up
+> --disk` would grow the vmdk but leave the guest root FS stranded behind the
+> swap. With root as the single/last partition it grows cleanly (`growpart` +
+> `resize2fs`). Swap parity is restored by a **2 GB `/swapfile`** (Step B.2.5a),
+> matching the preseed `late_command`.
 > **WHAT:**
-> - Partitioning method: **Guided - use entire disk**.
-> - Disk: the single **SCSI3 (0,0,0) (sda)** (10 GB).
-> - Scheme: **All files in one partition (recommended for new users)** (this is
->   the *atomic* recipe — root + swap, no separate /home).
-> - **Finish partitioning and write changes to disk** → **Yes** to write.
-> **EXPECTED:** the installer formats ext4 + swap and begins the base-system
-> install.
-> **VERIFY:** post-boot `lsblk` shows `sda` with a root ext4 partition + swap;
-> `swapon --show` lists a swap device.
+> - Partitioning method: **Manual**.
+> - Select the single **SCSI3 (0,0,0) (sda)** disk → **Yes** to create a new
+>   empty partition table on it.
+> - Select the **FREE SPACE** → **Create a new partition** → accept the **max**
+>   size (the whole disk) → **Primary** → **Beginning** → set **Mount point: /**,
+>   **Use as: Ext4**, **Bootable flag: on** → **Done setting up the partition**.
+>   **Do NOT create a swap partition.**
+> - **Finish partitioning and write changes to disk** → **Yes** to write. If the
+>   installer warns *"You have not selected any partitions for use as swap
+>   space"*, answer **No** (continue with no swap partition — the /swapfile in
+>   B.2.5a replaces it).
+> **EXPECTED:** the installer formats a single ext4 root on `sda1` and begins the
+> base-system install.
+> **VERIFY:** post-boot `lsblk` shows `sda` with ONE root ext4 partition (`sda1`)
+> and no swap partition; `swapon --show` is empty (until B.2.5a).
+
+> **Step B.2.5a — Create the 2 GB /swapfile (swap parity, keeps root growable)**
+> **WHERE:** `vault-1` shell — either the installer's *"Execute a shell"* (the
+> preseed does this in `late_command`) or the first post-boot login.
+> **WHY:** restores 2 GB of swap without a partition, so root stays the single
+> growable partition.
+> **WHAT:**
+> ```
+> sudo dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+> sudo chmod 0600 /swapfile
+> sudo mkswap /swapfile
+> echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+> sudo swapon /swapfile
+> ```
+> **EXPECTED:** a 2 GB swapfile is active and persisted in `/etc/fstab`.
+> **VERIFY:** `swapon --show` lists `/swapfile` (2G); `free -h` shows ~2.0Gi swap.
 
 > **Step B.2.6 — Software selection: standard + SSH server only**
 > **WHERE:** `vault-1` console.
