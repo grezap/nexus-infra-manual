@@ -590,6 +590,145 @@ for ip in 155 156 157; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable 
 
 ---
 
+## 9. Production tuning — Apache Spark 3.5 + ZooKeeper 3.9
+
+> **Everything below is *beyond the lab replica*.** §5 ships the verbatim lab configs — 5
+> Spark nodes at 4 GB + 3 ZK nodes at 2 GB, `spark-defaults.conf` carrying only the
+> security/catalog wiring (§5.4.1) with **no memory or parallelism sizing**, and ZK on its
+> default JVM heap. This section is what you would change for a **production** Spark cluster +
+> ZooKeeper ensemble, and *why*; it never alters the §5 values. **Do not paste these onto the
+> 4 GB/2 GB lab VMs blindly.** The **OS-layer** knobs (swappiness, THP, ulimits, I/O scheduler)
+> live once in **[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)** —
+> both engines want them; only the engine-specific overrides are restated here. This guide has
+> **two** engines, tuned separately below: **Spark** (§9.1–9.3) and **ZooKeeper** (§9.4–9.5).
+
+---
+
+### Spark (masters + workers + executors)
+
+The lab leaves every sizing knob at the Spark default (driver/executor `1g`, executor cores =
+all on the worker, `shuffle.partitions=200`, Java serializer) — enough to run the §5.6 write
+proof, nowhere near tuned for real ETL. In standalone mode you size the **worker** (how much of
+the box it offers) and then the **per-application** executor/driver requests that carve it up.
+
+### 9.1 Executor & driver sizing (`spark-defaults.conf` / submit args)
+
+```properties
+# PRODUCTION — append to /opt/spark/conf/spark-defaults.conf (or pass per spark-submit).
+spark.driver.memory              4g
+spark.executor.memory            8g
+spark.executor.cores             4
+spark.executor.instances         6
+spark.executor.memoryOverhead    2g
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `spark.executor.memory` | **`8g`** (heap for a real working set; size to fit the worker) | unset (`1g`) | The JVM heap each executor gets for shuffle/aggregation/cache. `1g` spills to disk almost immediately on real data → jobs crawl. Leave headroom on the worker for `memoryOverhead` + the OS. |
+| `spark.executor.cores` | **`4`–`5`** (the classic "5 cores per executor" sweet spot) | unset (all worker cores → one fat executor) | Tasks per executor. Too many cores per executor causes HDFS/S3 client and GC contention; `≤5` balances throughput vs. contention. Cores × instances must fit the worker's vCPU. |
+| `spark.executor.instances` | **explicit** (e.g. `6`), or use dynamic allocation (§9.3) | unset (one executor per worker) | How many executors the app gets. Static sizing gives predictable capacity; pair with cores/memory so `instances × (cores, memory)` fits the cluster. |
+| `spark.executor.memoryOverhead` | **`2g`** (≈ 10–20 % of executor memory; more for PySpark/S3) | unset (`max(384m, 0.1×executor.memory)`) | Off-heap memory for the JVM's native buffers, the S3A/Netty buffers, and PySpark worker processes. The default `~384m` is the **#1 cause of `Container killed … exceeds memory limits`** — raise it for S3/Iceberg workloads. |
+| `spark.driver.memory` | **`4g`** (more for broadcast-heavy / large result-collecting jobs) | unset (`1g`) | The driver holds the DAG, broadcast tables, and any `collect()`ed results. `1g` OOMs the driver on a big broadcast join or a large collect, killing the whole application. |
+
+### 9.2 Memory management & executor GC
+
+```properties
+# PRODUCTION — append to spark-defaults.conf.
+spark.memory.fraction            0.6
+spark.memory.storageFraction     0.5
+spark.executor.extraJavaOptions  -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:InitiatingHeapOccupancyPercent=35
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `spark.memory.fraction` | **`0.6`** (raise to `0.75` for shuffle-heavy, no caching) | unset (`0.6`) | Fraction of (heap − 300 MB) for the **unified** execution+storage region; the rest is user data structures. Too low → more spilling; too high → risk of user-code OOM. |
+| `spark.memory.storageFraction` | **`0.5`** | unset (`0.5`) | Within the unified region, the floor reserved for **cached** blocks that execution can't evict. Lower it if you cache little and shuffle a lot (execution borrows more). |
+| Executor GC | **G1** `MaxGCPauseMillis=200` | unset (JVM default) | Large executor heaps under shuffle produce long pauses on the default collector; G1 with a bounded pause target keeps stragglers from stalling a whole stage. Set via `spark.executor.extraJavaOptions`. |
+
+### 9.3 Shuffle, serialization, AQE & shuffle-spill disk
+
+```properties
+# PRODUCTION — append to spark-defaults.conf.
+spark.serializer                 org.apache.spark.serializer.KryoSerializer
+spark.sql.shuffle.partitions     400
+spark.sql.adaptive.enabled       true
+spark.local.dir                  /mnt/nvme/spark-local
+spark.network.timeout            300s
+# Optional — let the cluster grow/shrink executors with demand (needs an external shuffle service):
+spark.dynamicAllocation.enabled  true
+spark.dynamicAllocation.shuffleTracking.enabled true
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `spark.serializer` | **`org.apache.spark.serializer.KryoSerializer`** | unset (`JavaSerializer`) | Kryo is far faster and more compact than Java serialization for shuffle + cache payloads — a broad, low-risk win. The Java default is slow and bloats shuffle bytes. |
+| `spark.sql.shuffle.partitions` | **`400`** (rule of thumb: ≈ total executor cores × 2–3; or let AQE coalesce) | unset (`200`) | Post-shuffle partition count. `200` under-parallelises big joins/aggregations (huge partitions, spill) and over-parallelises tiny ones. AQE (below) coalesces at runtime, but the starting point still matters. |
+| `spark.sql.adaptive.enabled` (AQE) | **`true`** (confirm — on by default since 3.2) | unset (`true` by default) | Adaptive Query Execution re-optimises at runtime: coalesces shuffle partitions, converts sort-merge → broadcast joins, and splits skewed partitions. Confirm it's on; it's the biggest free SQL win. |
+| `spark.local.dir` | **a dedicated fast disk** (`/mnt/nvme/…`, or several comma-separated) | unset (`/tmp`) | Where shuffle blocks + RDD spill land. On `/tmp` (often small or on the root/OS disk) a big shuffle fills the disk and fails the job; point it at fast, roomy, dedicated storage — ideally striped across disks. |
+| `spark.network.timeout` | **`300s`** | unset (`120s`) | The umbrella timeout for block fetches/heartbeats. Under GC pauses or heavy I/O the `120s` default triggers spurious executor-lost/task-retry churn; raising it steadies large jobs. |
+| `spark.dynamicAllocation.enabled` | **`true`** on a shared cluster (requires the external shuffle service or shuffle tracking) | unset (`false`) | Lets an application add executors when tasks queue and release them when idle, so many jobs share the cluster fairly instead of one pinning all workers. Off by default; needs the shuffle service so released executors don't lose shuffle data. |
+
+---
+
+### ZooKeeper (the Spark master-HA election quorum)
+
+ZooKeeper is small and **latency-critical** — Spark's master HA election lives in it. It does
+not need much RAM, but it must **never swap** and must **never run out of disk**, or the
+ensemble stalls and Spark can't elect a master. Note ZK here is the platform's **only
+plaintext-backplane service** (ADR-0035): quorum/election ride VMnet10 unencrypted by design,
+so production hardening (`sslQuorum=true` + X.509) is an *architecture* decision recorded in
+the ADR, not a tuning knob.
+
+### 9.4 ZooKeeper JVM heap (⚠️ never swap)
+
+The lab runs ZK on the tarball default heap (≈1 GB via `zkServer.sh`). That is actually the
+right *ballpark* for production too — ZK holds the entire data tree in memory but its dataset
+(here: a handful of Spark election znodes) is tiny, so a **small, fixed** heap is correct.
+
+```bash
+# PRODUCTION — pin a fixed small heap on each ZK node via the systemd unit (Environment=).
+# ZK is latency-sensitive: a fixed heap avoids GC growth pauses, and it must fit in RAM so it
+# NEVER swaps (a swapped ZK misses heartbeats -> false leader elections).
+Environment=JVMFLAGS=-Xms1g -Xmx1g -XX:+UseG1GC
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| ZK heap `-Xmx`/`-Xms` | **`1g`** fixed (`2g` only for large datasets; rarely more) | unset (≈`1g` default) | ZK keeps the whole znode tree + watches on-heap. Small **fixed** heap = short, predictable GC. Oversizing invites long pauses; **the heap + OS must fit in RAM with room to spare** so ZK never touches swap. |
+| `vm.swappiness` / no swap for ZK | **`1`** (or `memlock` the process) | unset (`60`) | **⚠️ the critical ZK rule.** A ZK server swapped out under memory pressure misses session/quorum heartbeats → the ensemble declares it dead and re-elects, which can bounce Spark's active master. Keep ZK resident (Guide 00 §9 `swappiness=1`). |
+
+### 9.5 Ensemble timing, autopurge (⚠️) & disk layout (`zoo.cfg`)
+
+```properties
+# PRODUCTION — zoo.cfg deltas from §5.3.1 (autopurge is ALREADY set in the lab — keep it).
+tickTime=2000
+initLimit=10
+syncLimit=5
+maxClientCnxns=200
+autopurge.snapRetainCount=3
+autopurge.purgeInterval=12
+dataDir=/var/lib/zookeeper          # snapshots
+dataLogDir=/mnt/nvme/zookeeper-txnlog   # transaction log on a SEPARATE fast disk
+# forceSync=yes                     # KEEP the default; never set 'no' on a durable ensemble
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `autopurge.purgeInterval` / `autopurge.snapRetainCount` | **`12` h / `3`** | **PRESENT** — `24` h / `3` (§5.3.1) | **⚠️ without autopurge the transaction logs + snapshots grow forever and fill the disk**, at which point ZK stops writing and the ensemble freezes. The lab already enables it (every 24 h, keep 3) — keep it on; a busy ensemble purges more often (12 h). |
+| `tickTime` | **`2000` ms** | **PRESENT** — `2000` (§5.3.1) | The base time unit; session timeouts and `initLimit`/`syncLimit` are counted in ticks. Lower for faster failure detection (more sensitive to jitter), higher on a noisy network. |
+| `initLimit` / `syncLimit` | **`10` / `5`** ticks | **PRESENT** — `10` / `5` (§5.3.1) | How long a follower may take to initially connect+sync (`initLimit`) and to stay in sync (`syncLimit`) before the leader drops it. Too tight → healthy followers evicted on a slow disk/net; too loose → slow failure detection. |
+| `maxClientCnxns` | **`200`+** (per client IP) | **PRESENT** — `60` (§5.3.1) | Per-IP connection cap. `60` is fine for 5 Spark nodes; raise it if many clients (or a proxy) connect from one address, or legitimate connections get refused. |
+| `dataLogDir` (txn log on its own fast disk) | **separate NVMe/SSD**, distinct from `dataDir` | unset (txn log shares `dataDir=/var/lib/zookeeper`) | ZK `fsync`s **every write to the transaction log before ack** — this is the latency-critical path. Putting the txn log on its own dedicated fast disk (away from snapshot writes + the OS) is the single biggest ZK performance win. |
+| `forceSync` | **`yes`** (the default — keep it) | unset (`yes`) | Forces an `fsync` of the txn log before acking. **Never set `no`** on a durable ensemble — it trades away crash-safety and can lose committed election state on power loss. Listed only to warn against "tuning" it off. |
+
+> **Where these build on the OS layer:** both engines want the Guide 00 §9 base — THP `never`,
+> `vm.swappiness=1` (**critical for ZK**, §9.4), the systemd `DefaultLimitNOFILE`/`nproc`
+> ceilings (Spark's JVM thread count; the lab already sets `LimitNOFILE=65536` in both units,
+> §5.1), and `mq-deadline`/`none` on the shuffle-spill (Spark) and txn-log (ZK) disks. Set the
+> OS layer once per Guide 00 §9, then these sections on top.
+
+---
+
 ### Cross-references
 
 - **0.L.3 architecture:** memory `project_nexus_infra_lakehouse_phase`; ADR-0035

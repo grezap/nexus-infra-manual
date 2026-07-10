@@ -530,6 +530,226 @@ To reset the schema but keep the cluster: `DROP DATABASE nexus ON CLUSTER nexus_
 
 ---
 
+## 9. Production tuning — ClickHouse
+
+> **Everything below is *beyond the lab replica*.** The §5 configs (`config.d/nexus-cluster.xml`,
+> `users.d/nexus-bootstrap.xml`, `keeper_config.xml`) ship **zero** memory/cache/pool
+> tuning — the data nodes are 6 GB and the Keepers 2 GB, so ClickHouse's built-in defaults
+> (RAM-ratio caps, default caches, core-count-derived threads) are fine and staying at
+> defaults keeps this guide a faithful 1:1 replay. This section is what you would set on a
+> **production** ClickHouse cluster (data nodes with tens–hundreds of GB of RAM, dozens of
+> cores, fast NVMe) and *why*. **Do not paste these onto the 2 GB/6 GB lab VMs blindly** —
+> most values assume production-sized RAM/cores and will OOM or starve a lab node.
+
+Two placement surfaces, and they are **not** interchangeable — get this wrong and the knob
+silently does nothing:
+
+- **Server-level** settings (memory ceilings, caches, background pools, MergeTree, listener
+  limits) live in a **`config.d/*.xml`** file, at the `<clickhouse>` root. They apply to the
+  whole server process; a change needs a `systemctl restart clickhouse-server`.
+- **Query/session** settings (per-query memory, threads, timeouts, spill-to-disk, partition
+  guards) live in a **`users.d/*.xml`** file, inside a `<profiles>` block — they are *profile*
+  defaults a client inherits, hot-reloaded (no restart) and overridable per-`SET`/per-user.
+
+**Keeper nodes are separate.** `ch-keeper-1/2/3` run `clickhouse-keeper`, not
+`clickhouse-server` — none of the server caches/pools/profiles below apply to them. Their
+only tunables are the `<coordination_settings>` + JVM-free memory footprint covered in §9.5.
+
+### 9.1 OS layer — inherit Guide 00 §9, with two ClickHouse overrides
+
+Apply the whole OS-layer tuning from **[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)**
+(sysctl, ulimits, I/O scheduler, journald) on every data node first. ClickHouse then
+**overrides two of those defaults** — do not take Guide 00's values verbatim here:
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| Transparent Huge Pages | **`madvise`** | unset (distro `madvise`/`always`) | **⚠️ ClickHouse is the ONE engine that overrides Guide 00 §9's `THP=never`.** CH's allocator (jemalloc) uses `madvise(MADV_HUGEPAGE)` deliberately for its large arenas; forcing THP fully off (as MongoDB/Redis require) *hurts* CH by denying those hugepages. Set `echo madvise > /sys/kernel/mm/transparent_hugepage/enabled` — **not** `never`, and **not** `always` (always causes `khugepaged` stalls). If a node runs *only* ClickHouse, leave the distro `madvise` default and skip Guide 00's disable-thp unit on it. |
+| `read_ahead_kb` | `4096` (scan-heavy OLAP) | unset (`128`–`256`) | Guide 00 recommends *low* readahead for the random-access OLTP engines; **ClickHouse is the exception** — its `MergeTree` scans are large sequential reads, so raise readahead back up on the data volume to pull big contiguous granule ranges in one go. |
+| `LimitNOFILE` (systemd) | **`500000`** | unset (unit default) | **⚠️** A data node holds an FD per open part file across many partitions + every client/interserver socket; the default `1024`/unit default is exhausted fast → `Too many open files`, failed merges, refused queries. Set it on the **unit**, not `limits.conf` (systemd ignores the latter — Guide 00 §9.3). Pair with `nofile 500000` in `limits.d` for non-systemd shells. |
+
+```bash
+# PRODUCTION — not applied in the lab. Raise the FD ceiling on the clickhouse-server unit.
+mkdir -p /etc/systemd/system/clickhouse-server.service.d
+cat > /etc/systemd/system/clickhouse-server.service.d/90-nofile.conf <<'EOF'
+[Service]
+LimitNOFILE=500000
+EOF
+systemctl daemon-reload && systemctl restart clickhouse-server
+# VERIFY: cat /proc/$(pgrep -n clickhouse-serv)/limits | grep 'open files' -> 500000
+# (the clickhouse deb also ships nofile=500000 in /etc/security/limits.d/clickhouse.conf for login shells)
+```
+
+### 9.2 Server memory & caches — `config.d/*.xml` (data nodes only)
+
+Server-wide ceilings and caches. In the lab these are all **unset**, so CH uses its
+RAM-ratio default (`0.9`) and default cache sizes — which on a 6 GB VM CH auto-clamps.
+
+```bash
+# PRODUCTION — not applied in the lab. Data nodes only. As root:
+cat > /etc/clickhouse-server/config.d/nexus-tuning-memory.xml <<'EOF'
+<?xml version="1.0"?>
+<clickhouse>
+    <!-- cap the whole server at 90% of host RAM (leave headroom for page cache + OS) -->
+    <max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>
+    <!-- or pin an absolute byte ceiling instead of the ratio (0 = use the ratio above): -->
+    <max_server_memory_usage>0</max_server_memory_usage>
+    <!-- primary-key marks cache: keep hot; 5 GB is the default and a sane floor -->
+    <mark_cache_size>5368709120</mark_cache_size>
+    <!-- decompressed-block cache: OFF by default; only size it if you enable it per-profile -->
+    <uncompressed_cache_size>8589934592</uncompressed_cache_size>
+    <max_concurrent_queries>100</max_concurrent_queries>
+</clickhouse>
+EOF
+chown root:clickhouse /etc/clickhouse-server/config.d/nexus-tuning-memory.xml
+chmod 0640 /etc/clickhouse-server/config.d/nexus-tuning-memory.xml
+systemctl restart clickhouse-server
+```
+
+| Setting (`config.d` root) | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `max_server_memory_usage_to_ram_ratio` | `0.9` | unset (default `0.9`) | The server-wide RAM ceiling as a fraction of total RAM; above it, queries are killed with `MEMORY_LIMIT_EXCEEDED` before the OS OOM-killer nukes the whole process. `0.9` leaves 10% for OS page cache. On a co-located node lower it (e.g. `0.7`). |
+| `max_server_memory_usage` | `0` (use the ratio) *or* an absolute byte value | unset (`0`) | Absolute alternative to the ratio — set this (e.g. `120000000000` for 120 GB) when the host runs other services and you want a fixed byte cap regardless of total RAM. `0` = defer to the ratio. |
+| `mark_cache_size` | `5368709120` (5 GB) — raise for many-column/many-part tables | unset (default 5 GB) | Caches the primary-key **marks** (granule offsets) so range scans skip the index read; a too-small mark cache re-reads `.mrk` files on every query → I/O amplification. 5 GB suits most; size it toward the working set of `system.parts` mark bytes on wide schemas. |
+| `uncompressed_cache_size` | `8589934592` (8 GB) | unset (default 8 GB, but **unused**) | Caches *decompressed* blocks. Only helps when `use_uncompressed_cache=1` (see §9.4) — pointless for the typical full-scan OLAP pattern, valuable for repeated point/short-range lookups. Size it *only* if you turn the cache on. |
+| `max_concurrent_queries` | `100` | unset (default `100`) | Hard cap on simultaneously-executing queries; the 101st gets `TOO_MANY_SIMULTANEOUS_QUERIES` instead of thrashing every query into memory pressure. Raise with core count; keep below the point where `max_memory_usage × this` exceeds the server ceiling. |
+
+### 9.3 Background pools — `config.d/*.xml` (data nodes only)
+
+Merges, mutations, fetches, and the replication/DDL schedulers run on background thread
+pools. Undersized pools on a busy `ReplicatedMergeTree` cluster mean merges fall behind →
+part count climbs → `parts_to_delay/throw_insert` (§9.5) starts throttling/rejecting inserts.
+
+```bash
+# PRODUCTION — not applied in the lab. Data nodes only. As root:
+cat > /etc/clickhouse-server/config.d/nexus-tuning-pools.xml <<'EOF'
+<?xml version="1.0"?>
+<clickhouse>
+    <background_pool_size>16</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>2</background_merges_mutations_concurrency_ratio>
+    <background_schedule_pool_size>128</background_schedule_pool_size>
+</clickhouse>
+EOF
+chown root:clickhouse /etc/clickhouse-server/config.d/nexus-tuning-pools.xml
+chmod 0640 /etc/clickhouse-server/config.d/nexus-tuning-pools.xml
+systemctl restart clickhouse-server
+```
+
+| Setting (`config.d` root) | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `background_pool_size` | `16` (≈ #cores) | unset (default `16`) | Threads available for background merges + mutations. Too small → merges lag behind ingest, part count explodes, inserts stall; scale it toward core count on merge-heavy ingest. |
+| `background_merges_mutations_concurrency_ratio` | `2` | unset (default `2`) | Multiplier of *tasks* over threads (`pool_size × ratio` = concurrent merge/mutation slots) so many small merges can be scheduled without one giant merge hogging a thread; `2` lets short merges interleave. |
+| `background_schedule_pool_size` | `128` | unset (default `128`/`512`) | Threads for the *lightweight periodic* jobs — replication queue processing, Keeper session upkeep, DDL-queue polling, part cleanup. A replicated cluster with many tables needs headroom here or replication/DDL fan-out visibly lags. |
+
+### 9.4 Query profiles & quotas — `users.d/*.xml` (data nodes only)
+
+Per-query resource limits and a **separate readonly profile**. The lab's
+`users.d/nexus-bootstrap.xml` only grants the `default` user `access_management` — it sets
+**no** `<profiles>`/`<quotas>`, so every query runs with CH's stock profile. Production
+splits an analyst-facing readonly profile off from the ingest/admin `default`.
+
+```bash
+# PRODUCTION — not applied in the lab. Data nodes only (identical file on all 6). As root:
+cat > /etc/clickhouse-server/users.d/nexus-profiles.xml <<'EOF'
+<?xml version="1.0"?>
+<clickhouse>
+    <profiles>
+        <default>
+            <max_memory_usage>10000000000</max_memory_usage>             <!-- 10 GB / query -->
+            <max_threads>16</max_threads>                                <!-- = physical cores -->
+            <max_execution_time>0</max_execution_time>                   <!-- ingest/admin: no cap -->
+            <use_uncompressed_cache>0</use_uncompressed_cache>
+            <max_bytes_before_external_group_by>8000000000</max_bytes_before_external_group_by>
+            <max_bytes_before_external_sort>8000000000</max_bytes_before_external_sort>
+            <max_partitions_per_insert_block>100</max_partitions_per_insert_block>
+        </default>
+        <readonly>
+            <readonly>1</readonly>                                       <!-- SELECT + SET only -->
+            <max_memory_usage>5000000000</max_memory_usage>             <!-- tighter: 5 GB -->
+            <max_threads>8</max_threads>
+            <max_execution_time>60</max_execution_time>                  <!-- kill runaway analyst queries -->
+            <max_partitions_to_read>100</max_partitions_to_read>
+            <use_uncompressed_cache>1</use_uncompressed_cache>
+        </readonly>
+    </profiles>
+    <quotas>
+        <analyst_quota>
+            <interval>
+                <duration>3600</duration>
+                <queries>10000</queries>
+                <read_rows>1000000000000</read_rows>
+                <execution_time>3600</execution_time>
+            </interval>
+        </analyst_quota>
+    </quotas>
+    <users>
+        <!-- bind app_ro-style users to the readonly profile + quota -->
+        <!-- <analyst><profile>readonly</profile><quota>analyst_quota</quota>...</analyst> -->
+    </users>
+</clickhouse>
+EOF
+chown root:clickhouse /etc/clickhouse-server/users.d/nexus-profiles.xml
+chmod 0640 /etc/clickhouse-server/users.d/nexus-profiles.xml
+# hot-reloaded — no restart needed. VERIFY: SELECT name,value FROM system.settings WHERE name='max_threads'
+```
+
+| Setting (profile in `users.d`) | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `max_memory_usage` | `10000000000` (10 GB) in `default`; tighter in `readonly` | unset (default 10 GB) | **Per-query** RAM ceiling (distinct from the §9.2 *server* ceiling). Bounds a single runaway `GROUP BY`/`JOIN` so it fails with `MEMORY_LIMIT_EXCEEDED` instead of starving every other query. Set it *below* `server_ceiling ÷ max_concurrent_queries`. |
+| `max_threads` | `16` (= physical cores) | unset (default = #cores) | Threads *per query* for parallel scan/aggregation. CH defaults to the core count; pin it explicitly to keep a fat query from oversubscribing all cores, or lower it in the `readonly` profile so ad-hoc analysts don't monopolise the box. |
+| `max_execution_time` | `0` (ingest) / `60` (readonly) | unset (`0` = no limit) | Wall-clock cap that kills long queries. Leave `0` for trusted ingest/admin; set a bound (e.g. `60`) in the analyst profile so a bad `SELECT *` can't run for an hour. |
+| `use_uncompressed_cache` | `0` (default) / `1` (point-lookup profiles) | unset (`0`) | Toggles the §9.2 uncompressed cache **per profile**. Off is right for scan-heavy OLAP (would thrash the cache); turn it on only for a profile doing repeated small-range lookups, and size `uncompressed_cache_size` to match. |
+| `max_bytes_before_external_group_by` / `_sort` | `8000000000` (8 GB) | unset (`0` = spill disabled) | **Spill-to-disk thresholds.** With `0`, a `GROUP BY`/`ORDER BY` bigger than `max_memory_usage` simply fails; set these to ~half of `max_memory_usage` so big aggregations spill to temp disk and *complete* (slower) instead of erroring. |
+| `max_partitions_to_read` | `100` (readonly guard) | unset (`-1` = unlimited) | Rejects a query that would touch more than N partitions — a guard-rail against an accidental full-history scan across every partition. Set it in the analyst profile, leave unlimited for admin/backfills. |
+| `max_partitions_per_insert_block` | `100` | unset (default `100`) | Caps how many partitions a single `INSERT` block may create; a badly-keyed insert spraying rows across thousands of partitions is a classic "too many parts" self-DoS. `100` catches the mistake early. |
+
+### 9.5 MergeTree engine settings — `config.d/*.xml` (data nodes) + Keeper notes
+
+`MergeTree`-family defaults that govern part sizing and the insert back-pressure curve. Set
+them server-wide via a `<merge_tree>` block in `config.d` (or per-table `SETTINGS`); the lab
+tables in §5.6 take all defaults.
+
+```bash
+# PRODUCTION — not applied in the lab. Data nodes only. As root:
+cat > /etc/clickhouse-server/config.d/nexus-tuning-mergetree.xml <<'EOF'
+<?xml version="1.0"?>
+<clickhouse>
+    <merge_tree>
+        <index_granularity>8192</index_granularity>
+        <parts_to_delay_insert>150</parts_to_delay_insert>
+        <parts_to_throw_insert>300</parts_to_throw_insert>
+    </merge_tree>
+</clickhouse>
+EOF
+chown root:clickhouse /etc/clickhouse-server/config.d/nexus-tuning-mergetree.xml
+chmod 0640 /etc/clickhouse-server/config.d/nexus-tuning-mergetree.xml
+systemctl restart clickhouse-server
+```
+
+| Setting (`<merge_tree>` in `config.d`) | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `index_granularity` | `8192` | unset (default `8192`) | Rows per primary-key mark (one index entry per granule). `8192` is the sweet spot; lower it (e.g. `1024`) only for point-lookup-heavy tables to shrink the granule scanned per lookup, at the cost of a bigger mark cache footprint. |
+| `parts_to_delay_insert` | `150` | unset (default `150`) | Once an active-part count per partition crosses this, CH **throttles** inserts (sleeps) to let merges catch up — the first line of ingest back-pressure. Raise it only if merges genuinely keep pace on faster storage. |
+| `parts_to_throw_insert` | `300` | unset (default `300`) | The hard stop: past this, inserts are **rejected** with `TOO_MANY_PARTS`. Hitting it means merges are losing — fix by enlarging `background_pool_size` (§9.3) or batching inserts, not by blindly raising this. |
+| `max_bytes_before_external_group_by`/`_sort` | see §9.4 | — | (Query-scope spill, lives in the profile — cross-referenced here because it pairs with part/merge sizing under memory pressure.) |
+
+**Keeper nodes (`ch-keeper-1/2/3`) — `keeper_config.xml`, not server config.** None of §9.2–9.5
+applies to Keeper. Its footprint is the in-memory znode set + snapshot/log storage, so
+production tuning is confined to `<coordination_settings>` (already present in §5.3.1) and
+sizing the data disk:
+
+| Setting (`<coordination_settings>` in `keeper_config.xml`) | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `session_timeout_ms` | `30000` | `30000` (§5.3.1) | How long a server's Keeper session survives a network blip before its ephemeral znodes drop (triggering replica re-registration). Too low → spurious replica flaps on a busy backplane. Lab already sane. |
+| `operation_timeout_ms` | `10000` | `10000` (§5.3.1) | Per-op deadline; raise only if a large `ON CLUSTER` DDL fan-out legitimately runs long. |
+| `snapshot_distance` / `reserved_log_items` | tune for log-disk headroom | unset (defaults) | On a high-DDL/high-replication cluster the RAFT log grows between snapshots; give the Keeper `log`/`snapshots` dirs their own fast disk and keep an eye on `du` — a full Keeper disk stalls **all** coordination (and thus every insert). Keeper is CPU-light but latency-critical: keep the 3 nodes on low-contention hosts. |
+
+> **The two-file rule, restated:** a *server* ceiling/cache/pool/MergeTree knob that ends up
+> in a `users.d` profile is ignored, and a *query/session* knob placed at the `config.d`
+> `<clickhouse>` root is ignored. When a setting misbehaves, check `system.server_settings`
+> (config.d scope) vs `system.settings` (profile scope) to confirm it actually loaded.
+
+---
+
 ### Cross-references
 
 - **0.G.5 architecture + transients:** memory `project_nexus_infra_analytics_phase`; ADRs 0028 (Keeper) / 0029 (shard×replica) / 0031 (round-robin DNS) / 0032 (NFS backup)

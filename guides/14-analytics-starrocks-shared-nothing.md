@@ -494,6 +494,112 @@ To reset metadata for a clean re-bootstrap: on FE nodes
 
 ---
 
+## 9. Production tuning — StarRocks 3.5 (shared-nothing)
+
+> **Everything below is *beyond the lab replica*.** §5 ships the verbatim lab configs —
+> 6 VMs at 2 GB, FE heap pinned to `2g`, BE `mem_limit` left at its default, no storage
+> medium tags. This section is what you would change for a **production** StarRocks SN
+> cluster and *why*; it never alters the §5 values. **Do not paste these onto the 2 GB
+> lab VMs blindly** — an 8 GB FE heap alone won't fit. The **OS-layer** knobs (swappiness,
+> THP, ulimits, I/O scheduler) live once in **[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)** — a production BE host wants all of them; only the StarRocks-specific override is restated here.
+
+### 9.0 ⚠️ Hard requirement — `vm.max_map_count` (BE will crash without it)
+
+This is **not** tuning — it is a **StarRocks BE launch requirement**. The BE mmaps every
+segment/column file it touches; at the kernel default of `65530` VMA mappings a BE under
+any real tablet/query load **exhausts its memory-map areas** and dies with
+`Cannot allocate memory` / `failed to mmap` / segfault-on-open — even with gigabytes of
+RAM free. The BE's own `bin/start_be.sh` pre-flight checks this and refuses to start if it
+is too low. The lab gets away with the default only because it never pushes enough
+tablets to hit the ceiling.
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `vm.max_map_count` (`/etc/sysctl.d/`) | **`262144`** (StarRocks docs' minimum; go higher for very tablet-dense BEs) | unset (`65530`) | **⚠️ required by every BE.** Below it the BE exhausts VMA mappings under load → `Cannot allocate memory`, crash-loop, or refusal to start. Raising it is free on a dedicated host. |
+
+```bash
+# PRODUCTION — required on every BE host (already in Guide 00 §9's 90-nexus-tuning.conf).
+echo 'vm.max_map_count = 262144' > /etc/sysctl.d/91-starrocks.conf
+sysctl --system
+# VERIFY: sysctl vm.max_map_count  -> vm.max_map_count = 262144
+```
+
+> It is set fleet-wide by **Guide 00 §9** (`/etc/sysctl.d/90-nexus-tuning.conf`); the
+> snippet above is the standalone form for a host built without that baseline. Set it
+> **before** the first BE start.
+
+### 9.1 FE — JVM heap (`fe.conf` → `JAVA_OPTS`)
+
+The FE is a Java process; its metadata catalog, query-plan structures, and BDB-JE edit-log
+cache all live on the JVM heap. The lab pins a tiny `-Xmx2g` (§5.3.1) purely to fit the
+2 GB VM; a production FE that holds a large catalog and coordinates many concurrent queries
+needs far more, and the heap should be **fixed** (`-Xms == -Xmx`) so the JVM never pays for
+runtime growth or fragments under GC.
+
+```bash
+# PRODUCTION — on each FE, replace the lab's JAVA_OPTS line in /opt/starrocks/fe/conf/fe.conf.
+# Fixed 8 GB heap (Xms == Xmx), G1 with a bounded pause target.
+JAVA_OPTS="-Xmx8g -Xms8g -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+AlwaysPreTouch"
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| FE `-Xmx` | **≥ 8 GB** (16–32 GB for a large catalog / high QPS) | `2g` | Undersized heap → frequent full GC pauses and `OutOfMemoryError` in the FE, which stalls *all* query planning + DDL because the FE is the single coordinator. |
+| FE `-Xms` | **`= -Xmx`** (pre-allocate) | unset (grows from default) | A fixed heap avoids mid-load heap-growth stalls and heap fragmentation; `-XX:+AlwaysPreTouch` faults the pages in at start so the first big query doesn't pay for it. |
+| FE `query_timeout` (`fe.conf` / session var, seconds) | `300` (raise per-workload for heavy ETL) | unset (`300` default) | Caps runaway queries so one bad scan can't hold coordinator resources indefinitely; too low kills legitimate large aggregations. Set per session for ETL rather than globally. |
+
+### 9.2 BE — memory & storage (`be.conf`)
+
+The BE is the C++ data plane: it holds the query execution memory, the tablet/column
+caches, and the compaction workers. In the lab each BE runs alone on its VM, so the default
+`mem_limit` (90% of host RAM) is fine; the moment a BE **co-locates** with anything else
+(another engine, a busy node_exporter/agent stack, or an over-committed hypervisor) you
+must set an **explicit** `mem_limit` so the BE's own accounting matches the RAM it may
+actually use — otherwise it plans for 90% of the box, over-commits, and gets OOM-killed.
+
+```bash
+# PRODUCTION — append to /opt/starrocks/be/conf/be.conf on each BE.
+# Explicit memory ceiling (absolute or %) + storage medium tag + compaction/query knobs.
+mem_limit = 80%                                  # or an absolute e.g. 48G when co-located
+storage_root_path = /opt/starrocks/be/storage,medium:SSD   # ,medium:HDD for spinning disk
+chunk_size = 4096
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| BE `mem_limit` | **explicit** — `80%`, or an absolute (`48G`) when the BE co-locates | unset (default `90%` of RAM) | The BE sizes its query + cache memory off this figure. Left at 90% on a shared box it plans for RAM it doesn't own and is **OOM-killed** mid-query; set it to what the BE actually owns. |
+| `storage_root_path` **medium tag** (`,medium:SSD` / `,medium:HDD`) | tag every path with its real medium | untagged (`/opt/starrocks/be/storage`) | Tells the FE which disks are fast so **storage-medium-aware** table properties and tiered/TTL storage place hot data on SSD. Untagged, StarRocks assumes HDD and can't honour SSD placement. |
+| BE `chunk_size` (rows per exec chunk) | `4096` (default; raise for wide scans) | unset (`4096`) | The vectorized batch width. Larger chunks amortise per-batch overhead on scan-heavy OLAP but cost more memory per pipeline; leave at default unless profiling says otherwise. |
+| BE `nofile` (open files) | `655350` | **PRESENT** — `LimitNOFILE=655350` in the systemd unit (§5.1.2) | A BE opens thousands of segment files + connections; the default `1024` yields `Too many open files` and dead tablets. The lab already ships this in the unit — **not** deferred. |
+
+### 9.3 BE — compaction & query parallelism (`be.conf`)
+
+StarRocks continuously **compacts** the many small tablet versions that writes produce into
+fewer larger ones; if compaction can't keep up, version counts climb and reads slow down
+(`too many versions` errors at the extreme). The defaults are tuned for a modest core count
+— a production BE with many cores should raise the compaction concurrency, and the query
+pipeline parallelism (`pipeline_dop`) should track the CPU it's allowed to use.
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `max_compaction_concurrency` (`be.conf`) | `-1` (auto) or an explicit cap sized to cores (e.g. `8`) on a busy box | unset (default) | Bounds the parallel compaction tasks. Too low → version backlog + `too many versions` write failures; unbounded on a small box → compaction starves queries of CPU/IO. |
+| Cumulative compaction — `cumulative_compaction_num_threads_per_disk`, `max_cumulative_compaction_num_singleton_deltas` | raise thread count per disk on SSD; larger delta merge window | unset (default) | Cumulative compaction merges the frequent small deltas; more threads per (fast) disk clears the small-file backlog that otherwise degrades scan performance. |
+| Query `pipeline_dop` (session / `fe.conf` default) | `0` (auto = per-core) or an explicit value ≤ vCPU | unset (`0` auto) | Degree of pipeline parallelism per fragment. `0` lets StarRocks pick from BE cores; pin it only to cap concurrency so one heavy query doesn't monopolise every core. |
+| `default_replication_num` (`fe.conf`) | **`3`** (matches a 3-BE cluster; survives one BE loss) | unset — set **per table** as `"replication_num"="3"` in §5.6 | The cluster-wide default for new tables. The lab sets it per-`CREATE TABLE` to teach the mechanism; production sets the FE default to `3` so every table is HA without remembering the property. On a single-BE dev box use `1`. |
+
+```sql
+-- PRODUCTION — set the cluster default so new tables are replicated ×3 automatically:
+ADMIN SET FRONTEND CONFIG ("default_replication_num" = "3");
+-- (persist by also adding `default_replication_num = 3` to each FE's fe.conf)
+```
+
+> **Where these build on the OS layer:** the BE additionally wants the Guide 00 §9 knobs —
+> `vm.swappiness=1`, THP `never`, the systemd `DefaultLimitNOFILE`/`nproc` ceilings (Java +
+> C++ threads), and — for scan-heavy OLAP — the *higher* `read_ahead_kb` noted there. Set
+> the OS layer once per Guide 00 §9, then this section on top.
+
+---
+
 ### Cross-references
 
 - **0.G.6 architecture + transients (S1–S7):** memory `project_nexus_infra_analytics_phase`; ADR-0030 (FE/BE topology), ADR-0031 (round-robin DNS), ADR-0032 (NFS backup)

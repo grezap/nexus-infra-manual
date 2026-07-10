@@ -642,6 +642,99 @@ done
 
 ---
 
+## 9. Production tuning — MinIO (distributed erasure-coded)
+
+> **Everything below is *beyond the lab replica*.** §5 ships the verbatim lab configs — 4
+> nodes at 2 GB, one 100 GB data VMDK each, `minio.conf` with only `MINIO_VOLUMES`/`OPTS`/
+> creds/`SERVER_URL` set (§5.5.2), everything else at the MinIO default. This section is what
+> you would change for a **production** object store, and *why*; it never alters the §5
+> values. The **OS-layer** knobs (swappiness, THP, I/O scheduler) live once in
+> **[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)** —
+> only the MinIO-specific overrides are restated here.
+>
+> **There is no heap to size.** MinIO is a single self-contained **Go** binary (§5.2.1) — no
+> JVM, no GC tuning, no `-Xmx`. It manages its own memory and leans hard on the OS page cache,
+> so the tuning surface is (a) a few server env vars in `minio.conf`, (b) the OS/filesystem/
+> network layer, and (c) the **erasure-set geometry**, which is an *architecture* decision, not
+> a runtime knob. That makes this §9 deliberately short.
+
+### 9.0 ⚠️ OS, filesystem & FD requirements
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `nofile` (open files) | **`1048576`** | **PRESENT** — `LimitNOFILE=1048576` in `nexus-minio.service` (§5.2.2) | **⚠️ required.** An erasure node keeps an FD open per object part it is reading/writing/healing plus every peer + client connection; at scale this reaches into the hundreds of thousands. The default `1024` yields `Too many open files` and failed reads. The lab already ships the high limit in the unit — **not** deferred. |
+| XFS mount options | **`noatime`** (XFS is MinIO's required FS) | **PRESENT** — `xfs defaults,noatime,nofail` (§5.1.2) | XFS is what MinIO recommends for the data drive; `noatime` stops every read from issuing a metadata write (an atime update), which on an object store's many-small-file access pattern is pure wasted I/O. The lab already sets both — **not** deferred. |
+| Transparent Huge Pages / `vm.swappiness` | THP `never`, `swappiness=1` | unset | THP compaction stalls and swapping hurt the page-cache-heavy read path; set fleet-wide in **[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)**. |
+| Dedicated data disk | one clean drive per node (no RAID under it) | **PRESENT** — dedicated 2nd VMDK, xfs (§5.1) | MinIO wants a raw dedicated drive per erasure set member and does its own redundancy — **do not** put it on a RAID volume (double-redundancy wastes capacity) or share it with `/`. The lab already gives each node a dedicated `/dev/sdb`. |
+
+### 9.1 Erasure-set geometry — an **architecture** choice, not a tunable
+
+`MINIO_STORAGE_CLASS_STANDARD=EC:N` sets the STANDARD class **parity** (`N` = parity shards per
+object; the set tolerates the loss of `N` drives/nodes). **The catch on this topology:** the
+erasure set is **fixed at 4 drives** (the 4 nodes, one drive each — see §2 / §5.5), so valid
+parity is only `EC:0`–`EC:2`, and MinIO already defaults to **`EC:2`** here (survives 1 node
+down read-write; the guide's §2 note spells this out). You **cannot** raise redundancy past
+`EC:2` by editing a config value — you get there by **adding nodes/drives** so a larger set
+supports `EC:3`/`EC:4`. That is a rebuild of the tier's topology (`vms.yaml` + more VMs), not a
+knob. Treat the row below accordingly.
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `MINIO_STORAGE_CLASS_STANDARD` | **`EC:4`** on a ≥8-drive set for enterprise durability; **`EC:2` is the ceiling on this fixed 4-drive set** | unset (defaults to `EC:2`) | Parity = how many simultaneous drive/node losses the pool survives while staying readable. Higher parity = more durability, less usable capacity. On a 4-drive set EC:2 is both the default and the max; higher parity needs **more drives** (architecture change), not a config edit. |
+| Erasure **set size** (# drives) | 8–16 per set for higher parity + parallelism | **4 (fixed)** — an architecture constraint (§2, §5.5) | The set size caps the achievable parity and the healing parallelism. Changing it means adding nodes/drives and re-forming the pool — out of scope for a config tune; see the §2 note that this is a design constraint of the 4-node lab. |
+| `MINIO_STORAGE_CLASS_RRS` (reduced-redundancy class) | `EC:2` for non-critical objects to reclaim capacity | unset | Lets you mark less-important buckets/objects with lower parity to trade durability for usable space. Only meaningful once the set is large enough to offer a *range* of parity. |
+
+### 9.2 Request concurrency & background scanner (`minio.conf`)
+
+The lab sets neither — the defaults are auto-derived from RAM, which is right at lab volume but
+worth pinning on a busy, larger node.
+
+```bash
+# PRODUCTION — append to /etc/nexus-minio/minio.conf on each node (re-render + restart to apply).
+MINIO_API_REQUESTS_MAX=1600           # cap concurrent S3 requests (0 = auto from RAM)
+MINIO_API_REQUESTS_DEADLINE=10s       # how long a request waits in the queue before 503
+MINIO_SCANNER_SPEED=default           # background scanner pace: slowest|slow|default|fast|fastest
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `MINIO_API_REQUESTS_MAX` | **explicit** (e.g. `1600`) sized to node RAM/cores | unset (`0` = auto ≈ RAM-derived) | Bounds concurrent S3 requests so a client stampede can't exhaust memory/FDs; excess requests queue rather than OOM the node. Auto-sizing off a small lab RAM figure would set an artificially low cap in production. |
+| `MINIO_API_REQUESTS_DEADLINE` | **`10s`** (raise for large-object/slow clients) | unset (`10s`) | How long a queued request waits before MinIO returns `503 SlowDown` — back-pressure that sheds load instead of piling latency. Too short → spurious 503s under normal bursts. |
+| `MINIO_SCANNER_SPEED` | **`default`**; `slow`/`slowest` on I/O-constrained nodes, `fast` when heal/ILM must catch up | unset (`default`) | Paces the background scanner that drives **healing**, lifecycle (ILM), and usage accounting. Faster clears a heal backlog sooner but competes with client I/O; slower protects foreground latency at the cost of slower self-healing. |
+
+### 9.3 Backplane network — jumbo frames for erasure & heal traffic
+
+Erasure write/read spreads shards across all 4 nodes and **healing streams whole objects
+between peers**, so the VMnet10 backplane (§4) carries heavy east-west traffic. On a real 10 GbE
+backplane, **jumbo frames (MTU 9000)** cut per-packet overhead materially for these large
+transfers — but MTU must be raised **end to end** (every node's `nic1` **and** the switch/VMnet10
+segment), or path-MTU mismatch causes silent fragmentation/black-holing.
+
+```bash
+# PRODUCTION — on each node, set nic1 (VMnet10 backplane) to MTU 9000 via systemd-networkd.
+# Requires the switch / VMnet10 to also carry 9000 end-to-end, or connectivity breaks.
+mkdir -p /etc/systemd/network
+cat >> /etc/systemd/network/20-nic1.network <<'EOF'
+[Link]
+MTUBytes=9000
+EOF
+systemctl restart systemd-networkd
+# VERIFY: ip link show nic1 | grep -o 'mtu 9000'  ; and a large ping must NOT fragment:
+#   ping -M do -s 8972 -c1 192.168.10.142   (from minio-1 -> minio-2)
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| Backplane MTU (`nic1`, VMnet10) | **`9000`** (jumbo), set end-to-end | unset (`1500`) | Erasure/heal moves large object streams between nodes; jumbo frames reduce packet count and CPU per byte on the backplane. **Must** match on every node + the switch or PMTU mismatch black-holes traffic — an all-or-nothing change. |
+
+> **Where these build on the OS layer:** a production MinIO node wants the Guide 00 §9 base —
+> THP `never`, `vm.swappiness=1`, and the `mq-deadline`/`none` I/O scheduler on the data drive —
+> on top of the XFS+`noatime`+high-`nofile`+dedicated-disk facts the lab already ships (§9.0).
+> There is no engine heap to size; MinIO's performance is the page cache + the disks + the
+> backplane, so tune those.
+
+---
+
 ### Cross-references
 
 - **0.L.1 architecture:** memory `project_nexus_infra_lakehouse_phase`; ADR-0033

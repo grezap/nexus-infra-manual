@@ -631,6 +631,129 @@ for ip in 21 22 23 24 25 26; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl di
 
 ---
 
+## 9. Production tuning — Apache Kafka 3.8 (KRaft)
+
+> **Everything below is *beyond the lab replica*.** §5 ships the verbatim lab configs — 15
+> VMs at 8 GB, the broker heap pinned to `-Xmx2g -Xms2g` (§5.2.2), and every thread/buffer/
+> retention knob left at the Kafka default. This section is what you would change for a
+> **production** KRaft cluster carrying real ingest, and *why*; it never alters the §5
+> values. **Do not paste these onto the lab VMs blindly** — a 6 GB heap on an 8 GB broker
+> leaves too little for the page cache Kafka actually depends on. The **OS-layer** knobs
+> (swappiness, THP, the systemd ulimit ceilings, I/O scheduler) live once in
+> **[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)** —
+> a production broker wants all of them; only the Kafka-specific overrides are restated here.
+>
+> **KRaft roles matter for sizing.** In this lab every broker is **combined-mode**
+> (`process.roles=broker,controller`, §5.2.1) — it carries both the data plane *and* a seat
+> in the metadata Raft quorum. That is fine at lab scale, but a large production cluster
+> **splits the roles**: 3 (or 5) dedicated `controller`-only nodes hosting the metadata log,
+> and separate `broker`-only nodes carrying partitions. Controllers are light (small heap,
+> fast disk for `__cluster_metadata`); the tuning below is for the **broker** role. Size the
+> two independently once they are split.
+
+### 9.0 ⚠️ OS-layer requirements (mostly in Guide 00 §9)
+
+These are **launch/robustness requirements**, not optional polish — a busy broker misbehaves
+without them. All four are set by **[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)**;
+they are restated here because Kafka is one of the engines that *depends* on them.
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `vm.max_map_count` (`/etc/sysctl.d/`) | **`262144`** | unset (`65530`) | **⚠️ required.** Kafka **mmaps every partition's `.index`/`.timeindex` file**; a broker with many partitions exhausts the default VMA ceiling and dies with `Map failed` / `Cannot allocate memory` — the *same* ceiling StarRocks hits (Guide 14). Free to raise. |
+| Transparent Huge Pages | **`never`** | unset (`madvise`) | **⚠️ recommended.** `khugepaged` compaction stalls cause multi-ms latency spikes on the JVM heap and page cache under sustained I/O. Disabled fleet-wide in Guide 00 §9. |
+| `nofile` (open files) | **≥ `100000`** (soft) — the lab already grants `1048576` in the unit | **PRESENT** — `LimitNOFILE=1048576` in `kafka.service` (§5.2.2) | A broker holds an FD per log segment + per connection; thousands of partitions × segments blow past the default `1024` → `Too many open files`, offline partitions. The lab already ships this in the unit — **not** deferred. |
+| `vm.swappiness` | **`1`** | unset (`60`) | Swapping the broker heap or hot page-cache pages out under memory pressure produces latency cliffs; `1` keeps them resident. Set in Guide 00 §9. |
+
+### 9.1 Broker JVM heap & GC — *leave most of the RAM to the page cache*
+
+This is the single most misunderstood Kafka knob. **Kafka does not cache messages on its own
+heap** — produce writes go into the OS **page cache** and are flushed to the log segment by
+the kernel; consume reads are served straight from the page cache (often via `sendfile`, zero-
+copy, never touching the JVM). So the broker's throughput is bounded by how much RAM the
+**OS** has for page cache, *not* by heap size. An oversized heap is actively harmful: it
+steals RAM the page cache needs and lengthens GC pauses. Kafka's own guidance is a **modest
+fixed heap** (commonly 5–6 GB even on 64 GB brokers) and **everything else left to the OS**.
+
+```properties
+# PRODUCTION — replace the lab's KAFKA_HEAP_OPTS in kafka.service (§5.2.2).
+# Fixed 6 GB heap (Xms == Xmx) + G1 with a tight pause target; the REMAINING RAM is page cache.
+Environment=KAFKA_HEAP_OPTS=-Xmx6g -Xms6g
+Environment=KAFKA_JVM_PERFORMANCE_OPTS=-XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:+ExplicitGCInvokesConcurrent
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `KAFKA_HEAP_OPTS` `-Xmx` / `-Xms` | **`-Xmx6g -Xms6g`** (fixed; rarely > 6 GB regardless of box size) | `-Xmx2g -Xms2g` | The heap holds request buffers, the metadata cache, and coordinator state — **not** message data. Oversizing it starves the page cache (Kafka's real cache) and lengthens GC; `Xms==Xmx` avoids mid-load heap-growth stalls. |
+| **Page cache** (RAM left to the OS) | **the majority of the box** — do **not** size a large heap | 8 GB box, 2 GB heap → ~6 GB cache | Reads/writes flow through the page cache; a broker whose working set (recent segments) fits in cache serves consumers zero-copy from RAM. This is *the* Kafka performance lever — protect it by keeping the heap small. |
+| GC | **G1** `MaxGCPauseMillis=20` | unset (JVM default G1) | A low, bounded pause target keeps producer/consumer tail latency flat; long stop-the-world pauses look like broker unavailability to clients and can trigger needless leader elections. |
+
+### 9.2 Broker threads & socket buffers (`server.properties`)
+
+The lab leaves the network/IO thread pools and socket buffers at their defaults — fine for a
+smoke test, but a production broker on 10 GbE with many partitions needs wider pools and
+bigger buffers or it bottlenecks on request handling and TCP windowing.
+
+```properties
+# PRODUCTION — append to /etc/nexus-kafka/server.properties on each broker.
+num.network.threads=8
+num.io.threads=16
+num.replica.fetchers=4
+socket.send.buffer.bytes=1048576
+socket.receive.buffer.bytes=1048576
+socket.request.max.bytes=104857600
+replica.socket.receive.buffer.bytes=1048576
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `num.network.threads` | **`8`** (scale with client connection count) | unset (`3`) | Threads that read requests off / write responses onto the sockets. Too few → requests queue in the socket layer and latency climbs under a connection storm. |
+| `num.io.threads` | **≈ number of data disks, or `8`–`16`** | unset (`8`) | Threads that do the actual disk read/write for produce/fetch. Should track the number of log directories/disks so I/O parallelism isn't throttled by the pool. |
+| `num.replica.fetchers` | **`4`** (raise on many-partition brokers) | unset (`1`) | Parallel fetcher threads a follower uses to replicate from leaders. `1` serialises replication of all partitions → followers fall out of ISR under load, hurting durability. |
+| `socket.send.buffer.bytes` / `socket.receive.buffer.bytes` | **`1048576`** (1 MB) | unset (`102400`) | TCP socket buffers; the 100 KB default caps throughput on high-bandwidth-delay links (bytes in flight = window). 1 MB lets a single connection fill a 10 GbE pipe. |
+| `socket.request.max.bytes` | **`104857600`** (100 MB; raise only for very large batches) | unset (`104857600`) | Hard ceiling on a single request's size — a safety valve against a malformed/huge request OOM-ing the broker. Default is usually right; raise in lockstep with `message.max.bytes` if you allow big messages. |
+
+### 9.3 Retention & log segments (`server.properties`)
+
+The lab never sets retention, so topics keep data for the Kafka default of **7 days** with no
+size cap — invisible in a smoke test, a disk-filler in production. Set retention (time and/or
+size) and segment size deliberately per the tier's storage budget.
+
+```properties
+# PRODUCTION — append to /etc/nexus-kafka/server.properties (or override per topic).
+log.retention.hours=168
+log.retention.bytes=-1
+log.segment.bytes=1073741824
+log.retention.check.interval.ms=300000
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `log.retention.hours` | **`168`** (7 d) — set per the data's replay/compliance window | unset (`168`) | How long records are kept before deletion. Too long fills disks; too short breaks late consumers / replay. Override per topic (`retention.ms`) for hot vs. archival streams. |
+| `log.retention.bytes` | **explicit cap per partition** (e.g. `50G`) on bounded disks; `-1` only with a strict time cap | unset (`-1`, unlimited) | A **per-partition** size ceiling — the real guard against a runaway producer filling the log dir. `-1` (unlimited) plus a long time window is how brokers silently run out of disk. |
+| `log.segment.bytes` | **`1073741824`** (1 GB; smaller for fine-grained retention/compaction) | unset (`1073741824`) | Retention and compaction operate at **segment** granularity — a closed segment is the unit deleted/compacted. Huge segments delay reclamation; tiny segments multiply open files. |
+
+### 9.4 Durability — replication, ISR, and `acks` (⚠️ the data-loss surface)
+
+The lab already ships the correct durability floor in §5.2.1 — **RF=3 + `min.insync.replicas=2`**
+on the internal topics — but a production operator must ensure **every** topic inherits it and
+that **producers send `acks=all`**, or the RF/ISR guarantee is silently defeated.
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `default.replication.factor` | **`3`** | **PRESENT** — `3` (§5.2.1) | New topics get 3 replicas → survive one broker loss. The lab already sets it; keep it and never create a production topic at RF=1. |
+| `min.insync.replicas` | **`2`** | **PRESENT** — `2` (§5.2.1) | With RF=3, requires ≥2 in-sync replicas to acknowledge a write. If ISR drops below 2 the partition rejects `acks=all` writes rather than risk acknowledging data held on a single node. |
+| **Producer `acks`** | **`acks=all`** (a *client* setting) | n/a (client-side) | **The knob that makes `min.insync.replicas` real.** `min.insync.replicas=2` only takes effect when the producer asks for `acks=all`; with `acks=1` (the client default) the leader acks before followers replicate, so a leader crash loses acknowledged data. Set `acks=all` + `enable.idempotence=true` on every durable producer. |
+| `unclean.leader.election.enable` | **`false`** (the default since 3.0) | unset (`false`) | Keep it `false` so an out-of-sync replica is never elected leader (which would silently discard committed records). Only enable to trade durability for availability, knowingly. |
+| `message.max.bytes` (broker) / `replica.fetch.max.bytes` | **raise together** if you allow >1 MB messages (e.g. `10485760` both) | unset (`1048588` / `1048576`) | The broker's max accepted record-batch size **and** the follower's max fetch size **must move together** — if `replica.fetch.max.bytes` < `message.max.bytes`, a large message is accepted by the leader but **can never be replicated**, wedging the partition. Match them (and the consumer's `max.partition.fetch.bytes`). |
+
+> **Where these build on the OS layer:** a production broker wants the full Guide 00 §9 base —
+> `vm.max_map_count=262144` and THP `never` (§9.0 above), `vm.swappiness=1`, the systemd
+> `DefaultLimitNOFILE`/`nproc` ceilings, and `mq-deadline`/`none` on the log-dir disks. Set the
+> OS layer once per Guide 00 §9, then this section on top. XFS is the recommended filesystem for
+> the Kafka log dirs (same as MongoDB/MinIO) over ext4.
+
+---
+
 ### Cross-references
 
 - **Network canon:** `nexus-platform-plan/docs/infra/network.md` (kafka `.21`–`.26` + ecosystem decade)

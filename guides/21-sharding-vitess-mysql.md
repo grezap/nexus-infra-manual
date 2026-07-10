@@ -71,8 +71,12 @@ physically lands across multiple shards, and VTOrc keeps each shard available.
   **vindex** maps a column to a shard (here a **hash** vindex on `customer_id`).
   *Why hash:* even distribution. *Otherwise:* a lookup vindex (for secondary keys).
 - **Durability policy.** `none` (async replication) for the lab — `semi_sync` (a write
-  acks only after a replica acks) needs the `semisync_source/replica` plugins loaded
-  (the 0.O.1 hardening). VTOrc still reparents on PRIMARY loss.
+  acks only after a replica acks) needs the `semisync_source/replica` plugins loaded.
+  **0.O.1 (2026-07-09) shipped *two* hardenings: `semi_sync` durability *and* an
+  engine-native `file` BackupStorage** (the `xtrabackup` hot-backup engine over an
+  NFSv4 repo). The concrete new **build + validate** content in this guide is the
+  backup layer — §5.4/§5.5 flags · §5.9 take & restore · §6 row 10 · §8 M1–M3. VTOrc
+  still reparents on PRIMARY loss.
 - **Full mTLS.** Every gRPC channel (vtgate↔tablet, vtctld↔tablet, tablet↔tablet),
   the mysqld wire, *and* the vtgate MySQL listener carry Vault-PKI certs. No
   `--server-name` on most clients — Go verifies against the **dial IP** (every
@@ -354,7 +358,10 @@ physically lands across multiple shards, and VTOrc keeps each shard available.
 > **WHY:** a tablet can't register until the **cell** exists, so vtctld comes up first.
 > ⚠️ the wrapper must use `vtctldclient`'s **client** flags `--vtctld-grpc-{ca,cert,key,server-name}`
 > (not the server-side `--grpc-*`, T5); and vtctld needs the **tablet-manager** client
-> certs so it can mTLS-dial tablets for reparent (T6).
+> certs so it can mTLS-dial tablets for reparent (T6). vtctld also carries the `file`
+> **BackupStorage** backend (`--backup-storage-implementation file
+> --file-backup-storage-root /vt-backups`, 0.O.1) so `GetBackups`/`RemoveBackup` list
+> the shared repo (§5.9); it needs no backup *engine* — only the tablets take/restore.
 > **WHAT:**
 > ```bash
 > CFG=/etc/nexus-vitess ; TLS=$CFG/tls
@@ -364,7 +371,8 @@ physically lands across multiple shards, and VTOrc keeps each shard available.
 >   --topo-etcd-tls-ca $TLS/ca.pem --topo-etcd-tls-cert $TLS/server-cert.pem --topo-etcd-tls-key $TLS/server-key.pem \
 >   --port 15000 --grpc-port 15999 --service-map grpc-vtctl,grpc-vtctld \
 >   --grpc-cert $TLS/server-cert.pem --grpc-key $TLS/server-key.pem --grpc-ca $TLS/ca.pem \
->   --tablet-manager-grpc-ca $TLS/ca.pem --tablet-manager-grpc-cert $TLS/server-cert.pem --tablet-manager-grpc-key $TLS/server-key.pem
+>   --tablet-manager-grpc-ca $TLS/ca.pem --tablet-manager-grpc-cert $TLS/server-cert.pem --tablet-manager-grpc-key $TLS/server-key.pem \
+>   --backup-storage-implementation file --file-backup-storage-root /vt-backups
 > EOF
 > chown root:vitess $CFG/vtctld.env ; chmod 0640 $CFG/vtctld.env
 > cat > /usr/local/sbin/nexus-vtctldclient <<'EOS'
@@ -395,7 +403,12 @@ physically lands across multiple shards, and VTOrc keeps each shard available.
 > in `ssl.cnf` (8.4 disables it by default — else `caching_sha2` RSA failures on the
 > `vt_repl` TCP path, T7). vttablet advertises its **VMnet10** host
 > (`--tablet-hostname`) — **don't** set `--db-host 127.0.0.1` (replicas would
-> self-replicate, T10).
+> self-replicate, T10). ⚠️ **For engine-native backups (0.O.1 / §5.9)** the tablet
+> runs mysqld in **managed mode**: **no `--db-socket`** (any db-connection param makes
+> vttablet treat mysqld as unmanaged + skip the my.cnf, so the backup engine gets
+> `Cnf==nil`, M2) + `--mycnf-file $DATAROOT/vt_$UIDPAD/my.cnf` (the backup engine needs
+> mysqld's my.cnf, M1); and the `[xtrabackup]` creds live in **`ssl.cnf`** (the tablet's
+> `EXTRA_MY_CNF`, re-merged on every my.cnf regen — survives restart/restore, M3).
 > **WHAT (per tablet — the load-bearing pieces; passwords from `vault kv get`):**
 > ```bash
 > CFG=/etc/nexus-vitess ; TLS=$CFG/tls ; DATAROOT=/var/lib/nexus-vitess
@@ -423,13 +436,20 @@ physically lands across multiple shards, and VTOrc keeps each shard available.
 > RESET BINARY LOGS AND GTIDS;
 > SQL
 > chown root:vitess $CFG/init_db.sql ; chmod 0640 $CFG/init_db.sql
-> # ssl.cnf -- mysqld wire TLS + re-enable mysql_native_password
+> # ssl.cnf -- mysqld wire TLS + re-enable mysql_native_password + [xtrabackup] creds
+> # (0.O.1). ssl.cnf is this tablet's EXTRA_MY_CNF (see mysqlctld.env below), so it is
+> # merged into EVERY my.cnf regeneration -- putting the xtrabackup creds HERE makes
+> # them survive a mysqld restart / RestoreFromBackup / reboot with NO disruptive
+> # mysqlctld restart (M3). mysqld ignores the [xtrabackup] group; only xtrabackup reads it.
 > cat > $CFG/ssl.cnf <<SSL
 > [mysqld]
 > ssl-ca=$TLS/ca.pem
 > ssl-cert=$TLS/server-cert.pem
 > ssl-key=$TLS/server-key.pem
 > mysql_native_password=ON
+> [xtrabackup]
+> user=vt_dba
+> password=$ALL
 > SSL
 > chown root:vitess $CFG/ssl.cnf ; chmod 0640 $CFG/ssl.cnf
 > # mysqlctld.env (--db-dba-user/-password so it can health-check across restarts, T12)
@@ -445,11 +465,13 @@ physically lands across multiple shards, and VTOrc keeps each shard available.
 >   --tablet-hostname $SELF --topo-implementation etcd2 --topo-global-server-address $ETCD --topo-global-root /vitess/global \
 >   --topo-etcd-tls-ca $TLS/ca.pem --topo-etcd-tls-cert $TLS/server-cert.pem --topo-etcd-tls-key $TLS/server-key.pem \
 >   --port 15101 --grpc-port 16101 --service-map grpc-queryservice,grpc-tabletmanager,grpc-updatestream \
->   --db-socket $DATAROOT/vt_$UIDPAD/mysql.sock --db-app-user vt_app --db-app-password $APP --db-dba-user vt_dba --db-dba-password $ALL \
+>   --mycnf-file $DATAROOT/vt_$UIDPAD/my.cnf --db-app-user vt_app --db-app-password $APP --db-dba-user vt_dba --db-dba-password $ALL \
 >   --db-allprivs-user vt_allprivs --db-allprivs-password $ALL --db-repl-user vt_repl --db-repl-password $REPL --db-filtered-user vt_filtered --db-filtered-password $ALL \
 >   --db-ssl-ca $TLS/ca.pem --db-ssl-cert $TLS/server-cert.pem --db-ssl-key $TLS/server-key.pem \
 >   --grpc-cert $TLS/server-cert.pem --grpc-key $TLS/server-key.pem --grpc-ca $TLS/ca.pem \
->   --tablet-manager-grpc-ca $TLS/ca.pem --tablet-manager-grpc-cert $TLS/server-cert.pem --tablet-manager-grpc-key $TLS/server-key.pem --restore-from-backup=false
+>   --tablet-manager-grpc-ca $TLS/ca.pem --tablet-manager-grpc-cert $TLS/server-cert.pem --tablet-manager-grpc-key $TLS/server-key.pem \
+>   --backup-storage-implementation file --file-backup-storage-root /vt-backups --backup-engine-implementation xtrabackup \
+>   --xtrabackup-root-path /usr/bin --xtrabackup-user vt_dba --xtrabackup-stream-mode xbstream --restore-from-backup=false
 > ENV
 > chown root:vitess $CFG/{mysqlctld.env,vttablet.env} ; chmod 0640 $CFG/{mysqlctld.env,vttablet.env}
 > mkdir -p $DATAROOT ; chown vitess:vitess $DATAROOT
@@ -557,6 +579,82 @@ physically lands across multiple shards, and VTOrc keeps each shard available.
 > **VERIFY:** that's the sharding proof — a single INSERT stream physically split
 > across both shards by the hash vindex. **➡ The sharded MySQL cluster is live.**
 
+### 5.9 — Engine-native BackupStorage: take & restore a backup by hand (0.O.1)
+
+> **Step 5.9.1 — Stand up the `file` BackupStorage repo (NFSv4) + xtrabackup on the tablets**
+> **WHERE:** NFS **server** on `vitess-control-1` (`.193`); NFS **clients** on the 6
+> tablet nodes (`.196–.201`), root shell.
+> **WHY:** the Vitess `file` backend needs one shared filesystem that **every tablet
+> and vtctld** see at the **same path** (`/vt-backups`); `xtrabackup` (Percona hot
+> physical backup) is the engine. Self-contained on the vitess VMnet10 backplane — no
+> MinIO, no swarm NFS ([[feedback_minimal_running_vms]]). The tablets already carry the
+> backup + `--mycnf-file` flags and the `ssl.cnf` `[xtrabackup]` creds from §5.5.1; this
+> step only adds the shared repo + the xtrabackup binary. ⚠️ NFSv4 pseudo-root
+> (`fsid=0`) means clients mount **`server:/`** ([[feedback_nfsv4_fsid0_pseudo_root]]);
+> the `vitess` uid/gid is identical on every node so NFS numeric id-mapping just works.
+> **WHAT (control node — NFS server + local bind mount so vtctld reads the repo):**
+> ```bash
+> EXPORT=/srv/nexus-vitess-backups ; MOUNT=/vt-backups
+> apt-get install -y nfs-kernel-server
+> mkdir -p "$EXPORT" ; chown vitess:vitess "$EXPORT" ; chmod 2775 "$EXPORT"
+> mkdir -p /etc/exports.d
+> echo "$EXPORT 192.168.10.0/24(rw,sync,no_subtree_check,fsid=0,root_squash)" > /etc/exports.d/nexus-vitess-backups.exports
+> systemctl enable --now nfs-server ; exportfs -ra ; exportfs -v | grep "$EXPORT"
+> mkdir -p "$MOUNT"          # bind the export locally so vtctld reads the SAME path
+> grep -q " $MOUNT " /etc/fstab || echo "$EXPORT $MOUNT none bind 0 0" >> /etc/fstab
+> mountpoint -q "$MOUNT" || mount --bind "$EXPORT" "$MOUNT"
+> ```
+> **WHAT (each of the 6 tablets — mount the repo + install xtrabackup):**
+> ```bash
+> MOUNT=/vt-backups ; NFS=192.168.10.193                       # control node's VMnet10 IP
+> sudo percona-release enable pxb-84-lts release 2>/dev/null || true
+> apt-get install -y nfs-common percona-xtrabackup-84
+> command -v xtrabackup && command -v xbstream                 # both present
+> mkdir -p "$MOUNT"
+> grep -q " $MOUNT " /etc/fstab || echo "$NFS:/ $MOUNT nfs4 _netdev,rw,hard,bg,noatime 0 0" >> /etc/fstab
+> mountpoint -q "$MOUNT" || mount -t nfs4 "$NFS:/" "$MOUNT"
+> sudo -u vitess test -w "$MOUNT" && echo REPO_OK              # vitess must be able to write
+> ```
+> ⏱ **If you added the §5.5.1 backup flags / `ssl.cnf` creds *after* the tablets were
+> already running**, roll a `systemctl restart nexus-vttablet` across the 6 —
+> **REPLICAS first, PRIMARIES last** — so mysqld stays up under mysqlctld and no
+> reparent fires (the same non-disruptive contract as cert-rotate).
+> **EXPECTED:** export served on `.193`; `/vt-backups` mounted + writable by `vitess`
+> on all 6 tablets and bind-mounted on the control node.
+> **VERIFY:** on the control node `nexus-vtctldclient GetBackups commerce/-80` →
+> **NOT** `no registered implementation` (an empty list is fine); `mountpoint -q
+> /vt-backups` succeeds on all 6 tablets + control.
+
+> **Step 5.9.2 — Take a backup, prove it lands on NFS, restore a tablet from it**
+> **WHERE:** `vitess-control-1`, root shell (via the wrapper); the `ls` verify reads
+> the bind-mounted repo on the same node.
+> **WHY:** prove `BackupShard` writes an xtrabackup image to the shared repo and
+> `RestoreFromBackup` re-seeds a tablet from it. Vitess picks a **REPLICA** to back up,
+> so the shard PRIMARY keeps serving.
+> **WHAT (take a backup of each shard):**
+> ```bash
+> nexus-vtctldclient BackupShard commerce/-80
+> nexus-vtctldclient BackupShard commerce/80-
+> nexus-vtctldclient GetBackups commerce/-80    # lists a <YYYY-MM-DD>.<HHMMSS>.<tablet-alias> entry
+> ```
+> **WHAT (prove the files landed on the NFS root — on the control node):**
+> ```bash
+> ls -R /vt-backups/commerce/-80                # a <date>.<time>.<alias> dir with MANIFEST + the xtrabackup stream
+> ```
+> **WHAT (restore a tablet from the latest backup):**
+> ```bash
+> # (a) an existing replica: re-seed nexus-102 from the latest shard -80 backup; it rejoins:
+> nexus-vtctldclient RestoreFromBackup nexus-102
+> # (b) a from-zero tablet: flip --restore-from-backup=true in that tablet's vttablet.env
+> #     (§5.5.1) before starting nexus-vttablet -- it restores the latest backup + auto-joins.
+> ```
+> **EXPECTED:** `BackupShard` completes with the backup taken from a replica;
+> `GetBackups` lists the new `<date>.<time>.<alias>` entry; `RestoreFromBackup` pulls +
+> replays the latest backup and the tablet rejoins as REPLICA (shard back at 1P+2R).
+> **VERIFY:** `nexus-vtctldclient GetTablets --keyspace commerce --shard -80` → the
+> restored tablet is `replica` + caught up; the `<date>.<time>.<alias>` dir exists under
+> `/vt-backups/commerce/-80`. **➡ Engine-native backup/restore proven.**
+
 ---
 
 ## 6. Validation — by-hand acceptance smoke (demo / playbook)
@@ -566,7 +664,7 @@ Condensed from `smoke-0.O.ps1`. Per-node SSH probes from the **build host**.
 - **Input:** the 12 nodes up; etcd quorum; each shard 1P+2R; vtgate routing; schema applied.
 - **Where observed:** SSH / `nexus-etcdctl` / `nexus-vtctldclient` on control / `mysql`
   via vtgate / web UIs (vtctld `:15000`, VTOrc `:16000`, vtgate `:15001`).
-- **Proves:** a sharded MySQL cluster with full mTLS + auto-failover.
+- **Proves:** a sharded MySQL cluster with full mTLS + auto-failover + engine-native backup/restore.
 - **Prerequisites:** Guides 00–04 alive; §5 complete.
 
 | # | Check | Command | Pass criteria |
@@ -580,9 +678,11 @@ Condensed from `smoke-0.O.ps1`. Per-node SSH probes from the **build host**.
 | 7 | **Sharding proof** | per-shard `SELECT COUNT(*) FROM customer` | both shards > 0 |
 | 8 | mTLS | etcd `client-cert-auth`; vtgate listener requires client cert | a no-cert connect fails |
 | 9 | **VTOrc auto-reparent** (chaos) | kill the PRIMARY's mysqld (`nexus-100`); VTOrc promotes a replica | a new PRIMARY within ~15–30 s; cluster still writable |
+| 10 | **Engine-native backup** (0.O.1) | `BackupShard commerce/-80` → `GetBackups commerce/-80`; `ls /vt-backups/commerce/-80` (control); `RestoreFromBackup nexus-102` | a `<date>.<time>.<alias>` backup dir on the NFS root; the restored tablet rejoins REPLICA (1P+2R) |
 
 **1–8 green ⇒ Guide 21 satisfied.** 9 is the HA payoff — VTOrc promotes a replica when
-a shard PRIMARY dies, with no manual intervention.
+a shard PRIMARY dies, with no manual intervention. 10 is the 0.O.1 engine-native backup
+proof — a real `xtrabackup` image on the shared `file` repo, restorable onto a tablet.
 
 ---
 
@@ -591,7 +691,9 @@ a shard PRIMARY dies, with no manual intervention.
 ```bash
 for ip in 194 195; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable --now nexus-vtgate'; done
 ssh nexusadmin@192.168.70.193 'sudo systemctl disable --now nexus-vtorc nexus-vtctld'
-for ip in 196 197 198 199 200 201; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable --now nexus-vttablet nexus-mysqlctld; sudo rm -rf /var/lib/nexus-vitess/vt_*'; done
+for ip in 196 197 198 199 200 201; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable --now nexus-vttablet nexus-mysqlctld; sudo umount /vt-backups 2>/dev/null; sudo sed -i "\#/vt-backups#d" /etc/fstab; sudo rm -rf /var/lib/nexus-vitess/vt_*'; done
+# 0.O.1 backup repo (control node): drop the bind mount + NFS export
+ssh nexusadmin@192.168.70.193 'sudo umount /vt-backups 2>/dev/null; sudo sed -i "\#/vt-backups#d" /etc/fstab; sudo rm -f /etc/exports.d/nexus-vitess-backups.exports; sudo exportfs -ra'
 for ip in 190 191 192; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable --now nexus-etcd'; done
 # gateway: rm /etc/dnsmasq.d/vitess-records.conf /etc/dnsmasq-vitess.hosts ; systemctl reload dnsmasq
 # then vmrun stop + deleteVM each of the 12 (Guide 00 §7).
@@ -617,7 +719,43 @@ for ip in 190 191 192; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable 
 | **T9** | seed to vtgate `Lost connection … reading authorization packet` | the vtgate MySQL listener requires a client cert (mTLS); the client presented none | connect with `--ssl-cert/--ssl-key/--ssl-ca` (+ `sudo` for the `0640` key) (§5.8.1). |
 | **T10** | seed write times out; replica IO `equal server ids` / `Source_Host 127.0.0.1` | `--db-host 127.0.0.1` made Vitess advertise 127.0.0.1 → replicas self-replicate; `semi_sync` blocked writes | drop `--db-host`/`--db-port` (advertise the VMnet10 host via `--tablet-hostname`); durability `none` (§5.5.1/5.6.1). |
 | **T12** | mysqld looks unstable across restarts | mysqlctld couldn't health-check mysqld (vt_dba retry loop) | give mysqlctld `--db-dba-user/-password` (§5.5.1). |
+| **M1** | `BackupShard`: `cannot perform backup without my.cnf` | mysqld is owned by **mysqlctld**, not launched by vttablet, so vttablet has no `Cnf` | add per-tablet `--mycnf-file /var/lib/nexus-vitess/vt_<uidpad>/my.cnf` to `VTTABLET_FLAGS` (§5.5.1). |
+| **M2** | still `Cnf==nil`; log `connection parameters were specified. Not loading my.cnf.` | any db-connection param makes vttablet treat mysqld as **unmanaged** + skip the my.cnf | **drop `--db-socket`** — in managed mode vttablet reads the socket from the my.cnf; the per-user `--db-*-user/password` flags still auth. Apply via a rolling restart (replicas first, primaries last; mysqld stays up → no reparent) (§5.5.1/§5.9.1). |
+| **M3** | xtrabackup `Access denied for 'vt_dba'@'localhost' (using password: NO)` | Vitess runs xtrabackup with `--defaults-file=<my.cnf>` + a **clean env** + never a password → `MYSQL_PWD`/`~/.my.cnf`/`/etc/my.cnf` are all ignored; the creds must be in the my.cnf's `[xtrabackup]` group | put them in **`ssl.cnf`** (the tablet's `EXTRA_MY_CNF`), which is re-merged into every my.cnf regeneration → survives mysqld restart / `RestoreFromBackup` / reboot with **no** disruptive mysqlctld restart (§5.5.1). |
 | **—** | Backplane down (etcd/gRPC can't connect) | VMware left nic1 NO-CARRIER at power-on | reconnect the 2nd NIC + `systemctl restart systemd-networkd` (as Guides 16–20). |
+
+---
+
+## 9. Production tuning — Vitess (MySQL sharding)
+
+> **Everything below is *beyond the lab replica*** — the §5 vttablet/vtgate flags and the
+> tablets' `init_db`/`my.cnf` are lab-scale on 8 GB nodes; this is what you would change
+> for a production shard. §5 is unchanged.
+>
+> **The 6 tablets are Percona Server 8.4.** Their MySQL/InnoDB + OS tuning (buffer pool,
+> `innodb_flush_log_at_trx_commit`, redo log, IO capacity, THP-off, swappiness, `nofile`)
+> is **[Guide 09 §9](./09-oltp-percona-xtradb-cluster.md)** — apply that layer per tablet
+> (minus the Galera/`wsrep` rows; Vitess replicas use plain async MySQL replication, not
+> Galera). The OS layer is **[Guide 00 §9](./00-lab-host-and-base-vm.md)**. This section
+> adds only the **Vitess wrapper** knobs that Percona alone doesn't have.
+
+### 9.1 vttablet — query-server pools & guards
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `--queryserver-config-pool-size` | `16`–`32` per tablet | default (`16`) | The read/connection pool vttablet holds against its local mysqld; too small ⇒ queries queue behind pool waits under fan-in from vtgate. |
+| `--queryserver-config-transaction-cap` | `20`–`50` | default (`20`) | Concurrent open transactions per tablet; exhaustion returns "tx pool full" and stalls writes — size to the shard's write concurrency. |
+| `--queryserver-config-query-timeout` / `--queryserver-config-transaction-timeout` | `30s` / `30s` | default | Kill runaway queries/transactions before they pin a connection and hold row locks across the shard. |
+| `--queryserver-config-max-result-size` / `--warn-result-size` | cap (e.g. `100000`) / warn | default | Guards vttablet OOM from an unbounded result set streamed through the tablet. |
+
+### 9.2 vtgate — routing, memory & failover buffering
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `--max_memory_rows` | bounded (e.g. `300000`) | default | Per-query row ceiling at the gateway; an unbounded cross-shard scan otherwise OOMs vtgate. |
+| `--enable_buffer` + `--buffer_size` + `--buffer_window` + `--buffer_max_failover_duration` | on, sized to peak QPS × window | ⚠️ **unset** | Buffers in-flight queries during a PlannedReparentShard so the VTOrc auto-reparent this guide demos is **transparent to clients** instead of surfacing errors — the single most impactful production add for a sharded Vitess. |
+| `--transaction_mode` | `MULTI` | default (`MULTI`) | Allows cross-shard transactions (2PC where needed); `SINGLE` rejects them. |
+| `--grpc_max_message_size` / `--mysql_server_query_timeout` | sized to workload | default | Large result batches + slow-query cutoffs at the SQL front door. |
 
 ---
 
@@ -628,8 +766,9 @@ for ip in 190 191 192; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable 
 - **Network canon:** `nexus-platform-plan/docs/infra/network.md` (vitess `.190–.201`,
   MAC `:CB–:D6`); `vms.yaml` (tier `07-vitess`)
 - **Automated equivalents:** `nexus-infra-vitess/packer/vitess-{etcd,gate,tablet}-node/`
-  + `terraform/envs/vitess/role-overlay-vitess-{etcd-bootstrap,gate,tablets,reparent,schema,tls}.tf`
-- **Smoke mirror:** `nexus-infra-vitess/scripts/smoke-0.O.ps1`
+  + `terraform/envs/vitess/role-overlay-vitess-{etcd-bootstrap,gate,tablets,reparent,schema,tls}.tf`;
+  **0.O.1 backup:** `role-overlay-vitess-backup-storage.tf` + handbook §3.2 (M1–M3)
+- **Smoke mirror:** `nexus-infra-vitess/scripts/smoke-0.O.ps1` (§9.5 = the backup gate)
 - **Sibling sharding tier:** [`22-sharding-citus-postgresql.md`](./22-sharding-citus-postgresql.md) (Citus = the PostgreSQL sharding axis)
 - **Contrast:** [`10-oltp-patroni-postgresql-ha.md`](./10-oltp-patroni-postgresql-ha.md) (PG HA by replication, not sharding)
 - **Transients:** [[feedback_cluster_template_nftables_backplane]] · [[terraform-heredoc-powershell]]

@@ -616,6 +616,128 @@ for ip in 64 65 66; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable --n
 
 ---
 
+## 9. Production tuning — PostgreSQL 17 under Patroni
+
+> **Everything below is *beyond the lab replica*.** The §5.4.1 `patroni.yml` is what the
+> lab actually ships — 4 GB PG VMs sized to *form the cluster and prove streaming
+> replication + auto-failover + mTLS*, not to carry production load. This section is what
+> you would change on a **production** deployment and why. It does **not** alter the §5
+> renders. **Do not paste these onto the 4 GB lab VMs blindly** — `shared_buffers`,
+> `effective_cache_size`, and static hugepages all assume production-sized RAM.
+>
+> **OS layer first.** A production PG host also needs the kernel / ulimit / THP tuning in
+> [Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)
+> — set that once per host, then add the engine overrides below. PostgreSQL is the one
+> engine that wants **THP off *and* static `HugePages` on** (§9.3) plus `memlock` unlimited.
+
+### 9.1 How you change these — Patroni owns `postgresql.conf`, so use `patronictl edit-config`
+
+⚠️ **Do not `ALTER SYSTEM` these and do not hand-edit `postgresql.conf`.** Patroni is the
+source of truth for the Postgres config: it renders `postgresql.conf` from the cluster
+spec in the **DCS (etcd)** on every start, so a manual `ALTER SYSTEM` / file edit is
+**overwritten on the next restart or reload**. Production parameters go into the **dynamic
+cluster configuration** — `bootstrap.dcs.postgresql.parameters` at bootstrap, and
+`patronictl edit-config` thereafter — which Patroni writes to etcd and applies to **every
+member** (leader + replicas) uniformly.
+
+```bash
+# PRODUCTION — not applied in the lab. Run on any PG node; edits the whole cluster's config.
+# Opens the live DCS config in $EDITOR; under `postgresql: parameters:` add/adjust:
+sudo patronictl -c /etc/nexus-patroni/patroni.yml edit-config nexus-pg
+```
+
+```yaml
+# The block you are editing (production values for a 4-vCPU / 16 GB PG node):
+postgresql:
+  use_pg_rewind: true
+  use_slots: true
+  parameters:
+    # --- memory ---
+    shared_buffers: 4GB                 # ≈ 25% of RAM
+    effective_cache_size: 12GB          # ≈ 75% of RAM (a planner hint, allocates nothing)
+    work_mem: 32MB                      # per sort/hash node — see the formula below
+    maintenance_work_mem: 1GB           # VACUUM / CREATE INDEX / bulk load
+    huge_pages: "on"                    # ⚠️ requires pre-allocated OS hugepages — §9.3
+    # --- WAL / checkpoint ---
+    max_wal_size: 8GB
+    min_wal_size: 2GB
+    checkpoint_completion_target: 0.9
+    wal_compression: "on"
+    # --- replication ---
+    hot_standby_feedback: "on"
+    # --- planner / SSD ---
+    random_page_cost: 1.1
+    effective_io_concurrency: 200
+    # --- observability / autovacuum ---
+    shared_preload_libraries: pg_stat_statements
+    autovacuum_vacuum_cost_limit: 2000
+```
+
+> **Reload vs. restart.** After `edit-config`, Patroni marks members "pending restart" for
+> parameters that need one. Memory/preload params (`shared_buffers`, `huge_pages`,
+> `shared_preload_libraries`, `max_connections`, `max_wal_senders`) are **restart-only** —
+> apply them with a rolling `sudo patronictl -c … restart nexus-pg --role replica` first,
+> then switchover and restart the old leader, to keep the writer available. The rest
+> (`work_mem`, `effective_cache_size`, `checkpoint_completion_target`, `autovacuum_*`,
+> `random_page_cost`) take effect on **reload** (`patronictl reload nexus-pg`).
+
+### 9.2 Memory, WAL, planner & autovacuum
+
+| Setting | Production value | Lab value (§5.4.1) | Why it matters |
+|---|---|---|---|
+| `shared_buffers` | **≈ 25 % of RAM** (e.g. `4GB` on 16 GB) | `256MB` | Postgres's own page cache. ~25 % is the sweet spot — Postgres deliberately relies on the OS page cache too (unlike InnoDB), so pushing it much higher yields double-buffering, not more cache. **Restart-only.** |
+| `effective_cache_size` | **≈ 75 % of RAM** (e.g. `12GB`) | unset (default `4GB`) | A **planner hint** — it allocates nothing; it tells the planner how much data is likely cached (in `shared_buffers` + OS cache) so it favours index scans over seq scans. Too low ⇒ needless sequential scans. |
+| `work_mem` | **≈ RAM / (`max_connections` × avg parallel sort/hash nodes)** — e.g. 16 GB / (200 × ~2) ≈ `32MB` | unset (default `4MB`) | Per **sort/hash node** (a single query can use several × its parallel workers), so the true ceiling is `work_mem × nodes × connections`. Too high ⇒ OOM under concurrency; too low ⇒ sorts spill to disk. Size against `max_connections`, or lower `max_connections` via pooling first (see note). |
+| `maintenance_work_mem` | **`512MB`–`1GB`** | unset (default `64MB`) | Memory for `VACUUM`, `CREATE INDEX`, `ALTER TABLE`, bulk restore. Higher = dramatically faster index builds and vacuum passes; it's per-maintenance-op and there are few concurrent ones, so it's safe to set high. |
+| `max_wal_size` / `min_wal_size` | **several GB** (e.g. `8GB` / `2GB`) | unset (`1GB` / `80MB`) | The soft ceiling that triggers a checkpoint. Too small on a write-heavy DB ⇒ frequent forced checkpoints → I/O spikes + WAL write amplification. Larger = fewer, smoother checkpoints (at the cost of longer crash recovery). |
+| `checkpoint_completion_target` | **`0.9`** | unset (default `0.9` in PG 17) | Spreads checkpoint page-flushing across 90 % of the interval instead of dumping it at once, smoothing the I/O spike. PG 14+ already defaults to `0.9` — set it explicitly so intent is documented. |
+| `wal_compression` | **`on`** (`lz4`/`zstd`) | unset (`off`) | Compresses full-page images in the WAL → less WAL volume → less network to ship to replicas and less disk. Cheap CPU for meaningful WAL reduction on OLTP. |
+| `hot_standby_feedback` | **`on`** | unset (`off`) | ⚠️ set on for **read-replica** workloads: the replica tells the primary which rows its running queries still need, so the primary's vacuum won't remove them out from under a long replica query (which would otherwise cause replication conflicts / query cancellations). Costs a little primary bloat — worth it when replicas serve reads. |
+| `random_page_cost` | **`1.1`** (SSD/NVMe) | unset (default `4.0`) | The default `4.0` assumes spinning disks where random I/O is ~4× sequential. On SSD random ≈ sequential, so `1.1` stops the planner from irrationally avoiding index scans. |
+| `effective_io_concurrency` | **`200`** (SSD/NVMe) | unset (default `1`) | How many concurrent I/Os the planner assumes the storage can service (drives bitmap-heap prefetch). `1` suits one spindle; SSDs handle hundreds. |
+| `shared_preload_libraries` | **`pg_stat_statements`** | unset | Loads the query-fingerprint stats extension (the #1 production tuning tool — shows which queries burn time/I/O). **Restart-only**; then `CREATE EXTENSION pg_stat_statements`. |
+| `autovacuum_vacuum_cost_limit` | **`2000`** (up from `200`) | unset (default `200`) | Raises autovacuum's I/O budget so it keeps pace with a high write rate on SSD; the default throttles vacuum so hard that dead tuples accumulate → table/index bloat + transaction-ID wraparound risk. Consider also more `autovacuum_max_workers` on many-table clusters. |
+
+> **Connection pooling vs. raw `max_connections`.** The lab sets `max_connections: 200`
+> directly. Each Postgres backend is a full OS process (~10 MB+ and a `work_mem` budget),
+> so a high raw `max_connections` wastes RAM and increases lock/latch contention. In
+> production, keep `max_connections` **moderate** (say `200-400`) and front it with a
+> **pooler** — **PgBouncer** in `transaction` mode — so thousands of client connections
+> multiplex onto a small backend pool. This is what lets `work_mem` be generous (the
+> divisor is the *real* backend count, not the client count). PgBouncer would sit on the
+> HAProxy nodes or beside each PG node; it is out of scope for the lab's §5 build.
+
+### 9.3 OS layer — THP off, static HugePages on, memlock (set per [Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier))
+
+PostgreSQL is the exception that wants **Transparent** Huge Pages **off** *and* **static**
+`HugePages` **on** — the static pages back `shared_buffers` without the runtime-compaction
+stalls that THP introduces. With `huge_pages: on`, **Postgres refuses to start** unless the
+kernel has enough hugepages pre-allocated, so allocate them first (or use `huge_pages: try`
+as the softer fallback — it silently falls back to 4K pages if the reservation is short).
+
+```bash
+# PRODUCTION — not applied in the lab. Compute the pages Postgres needs, then reserve them.
+# PG 15+ reports the exact count it wants for the current shared_buffers:
+sudo -u postgres psql -tAc "SHOW shared_memory_size_in_huge_pages;"   # e.g. 2100 (× 2 MB)
+
+cat > /etc/sysctl.d/91-nexus-postgres-hugepages.conf <<'EOF'
+vm.nr_hugepages = 2200          # the value above + a little headroom
+EOF
+sysctl --system
+# memlock must be unlimited for the postgres user (Guide 00 §9.3 sets this fleet-wide):
+#   postgres  soft/hard  memlock  unlimited
+# VERIFY: grep HugePages_Total /proc/meminfo   (matches nr_hugepages, and Free drops when PG starts)
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `huge_pages` (postgresql) | **`on`** + `vm.nr_hugepages` sized to `shared_buffers` | unset (`try` default) | ⚠️ Static hugepages back the shared-memory segment with 2 MB pages (fewer TLB misses, no `khugepaged` stalls). `on` **fails startup** if the reservation is short — pre-allocate `vm.nr_hugepages`, or use `try` to fall back gracefully. |
+| Transparent Huge Pages | **`never`** | unset | ⚠️ Disable THP (Guide 00 §9.2) — its background compaction stalls Postgres; static HugePages give the win without the stalls. |
+| `memlock` ulimit (`postgres`) | **`unlimited`** | unset | Required to lock the hugepage-backed shared memory; without it `huge_pages: on` cannot mlock and Postgres won't start. Guide 00 §9.3 grants it fleet-wide. |
+| `vm.swappiness` | `1` | unset (`60`) | Keeps `shared_buffers` + the OS page cache resident instead of swapped. Guide 00 §9.1. |
+
+---
+
 ### Cross-references
 
 - **Network canon:** `nexus-platform-plan/docs/infra/network.md` (Patroni `.60`–`.68`, VIP `.60`); ADR-0025 (LB-tier HA)

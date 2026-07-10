@@ -838,6 +838,73 @@ for ip in 117 118; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable --no
 
 ---
 
+## 9. Production tuning — Harbor registry
+
+> **Everything below is *beyond the lab replica*.** The lab renders the §5.5.2 `harbor.yml`
+> verbatim at lab-scale on 2 GB VMs — `max_job_workers: 10`, `cache.enabled: false`, and a
+> single 2-node bundled PG + single bundled Redis at default sizing. This section is what you
+> would change for a **production** registry carrying real CI push/pull + scan traffic, and
+> *why*. **Do not paste these onto the 2 GB lab VMs blindly.** Frame it as two layers: the
+> registry's **internal datastore** — size it exactly like the standalone engines (so link
+> out, don't duplicate) — plus these **Harbor-app knobs** the standalone engines don't have.
+
+### 9.1 The bundled datastore — size it like the standalone engines
+
+Harbor is stateless; every durable byte lives in its **bundled PostgreSQL 17** (the
+`registry-db` pair — `external_database` in §5.5.2) and its **bundled Redis** (the
+`external_redis` block, running in Harbor's **CACHE** role: session state, job queues,
+registry metadata cache). These are the *same* engines Guides 10 and 07 cover, so tune them
+**there** — this guide does not restate their knobs:
+
+- **Bundled PostgreSQL** (`registry` DB) → tune per **[Guide 10 §9](./10-oltp-patroni-postgresql-ha.md)**:
+  `shared_buffers` (≈25 % of RAM), `effective_cache_size` (≈50–75 % of RAM), `work_mem`,
+  checkpoint/WAL, plus the Guide 00 §9 OS layer. The lab leaves PG at defaults (128 MB
+  `shared_buffers`); a busy registry's metadata queries want it sized like any OLTP node.
+  Also raise `external_database.max_open_conns` (lab `100`) in step with PG `max_connections`.
+- **Bundled Redis** (CACHE role) → tune per **[Guide 07 §9](./07-oltp-redis-cluster.md)**:
+  set a hard **`maxmemory`** (≈50–60 % of the node's RAM) and — because this Redis is a
+  cache, not a data-of-record store — **`maxmemory-policy allkeys-lru`** so it evicts cold
+  keys instead of OOM-ing when the working set exceeds RAM. The lab sets neither (unbounded,
+  `noeviction`), which is fine at lab volume but a memory-exhaustion risk under real load.
+
+The rest of §9 is the layer the standalone engines have no equivalent for — Harbor's own
+application knobs, all in `harbor.yml` (re-render + `./install.sh` to apply).
+
+### 9.2 Harbor application knobs (`harbor.yml`)
+
+| Setting | Production value | Lab value (§5.5.2) | Why it matters |
+|---|---|---|---|
+| `jobservice.max_job_workers` | `10`–`50`, sized to registry-node cores × ~2 | `10` | Concurrency ceiling for **all** async jobs — replication, GC, retention, and Trivy scan dispatch share this pool. Too low serialises scans behind a GC; too high starves the DB/Redis it drives. Scale with core count and PG `max_open_conns`. |
+| **Garbage collection** schedule (UI/API: *Administration → Clean Up → GC*, or `PUT /api/v2.0/system/gc/schedule`) | Off-peak cron, e.g. `0 0 3 * * *` daily, ✅ *delete untagged* | none (manual only) | Blob GC is what actually reclaims MinIO/S3 space after tags are removed; without a schedule the `s3://harbor` bucket grows forever. GC takes a brief **read-only** window on the registry — run it off-peak. |
+| **Tag-retention policy** (per-project: *Project → Policy → Tag Retention*) | e.g. keep last **10** pulled + last **30 days**, per repo | none (unbounded) | Bounds how many artifact versions each repo keeps so GC has something to collect; without it every CI push accumulates forever. Retention only *marks* — GC (above) frees the blobs. |
+| `cache.enabled` (registry metadata cache) | `true`, `expire_hours: 24` | `false` | Caches manifest/metadata lookups in the bundled Redis so hot pulls skip a PG round-trip — materially cuts pull latency and DB load on a busy registry. Off in the lab to keep the Redis role minimal. |
+| `storage_service.s3` (registry blob backend) | keep `region`/`regionendpoint` local; add a CDN/pull-through cache for geo-distributed pulls | S3 → MinIO `s3://harbor`, `v4auth`, `forcepathstyle` | Blobs already live in object storage (correct); at scale the tuning is on the *object store* side (MinIO erasure/throughput) + a front cache, not Harbor. |
+| **Trivy scanner** — `trivy.skip_update: false`, adapter `SCANNER_TRIVY_VULN_TYPE`, and scan concurrency (bounded by `max_job_workers`) | Pre-warm/mirror the Trivy DB internally; keep `skip_update:false` but pin a mirror; raise workers so scans don't queue | `skip_update:false`, `offline_scan:false`, `timeout:5m0s` | Every scan is a jobservice job, so **scan concurrency = `max_job_workers`** minus whatever GC/replication is using. A slow/rate-limited Trivy DB pull (GitHub) stalls scans; production mirrors the DB and gives scans headroom. |
+| `upload_purging` (`enabled`/`age`/`interval`) | `enabled: true`, `age: 168h`, `interval: 24h` | **PRESENT** — `enabled:true, age:168h, interval:24h` | Purges orphaned partial-upload blobs (failed/aborted pushes) so they don't leak storage. The lab already ships the recommended values — noted here so it's not mistaken for a gap. |
+| `external_database.max_idle_conns` / `max_open_conns` | raise with PG capacity (e.g. `100`/`300`) | `50` / `100` | Harbor's PG connection pool; must track PG `max_connections` and `jobservice.max_job_workers` or jobs block on connection acquisition under load. |
+
+```yaml
+# PRODUCTION harbor.yml deltas — re-render on BOTH registry nodes (byte-identical, §5.5.2),
+# then `cd /opt/harbor && ./install.sh --with-trivy`. Not applied in the lab.
+jobservice:
+  max_job_workers: 25
+cache:
+  enabled: true          # lab: false — turn the bundled-Redis metadata cache on
+  expire_hours: 24
+external_database:
+  max_idle_conns: 100    # lab: 50
+  max_open_conns: 300    # lab: 100 — keep <= PG max_connections
+# GC + tag-retention are runtime policy, not harbor.yml — set them via the API/UI:
+#   curl -u admin:$PW -X PUT https://registry.nexus.lab/api/v2.0/system/gc/schedule \
+#     -d '{"schedule":{"type":"Daily","cron":"0 0 3 * * *"}}'
+```
+
+> **OS layer:** the registry + `registry-db` nodes are Debian hosts — apply
+> **[Guide 00 §9](./00-lab-host-and-base-vm.md)** (`nofile`, swappiness, THP-off for the
+> bundled Redis) exactly as for any data node before the engine knobs above.
+
+---
+
 ### Cross-references
 
 - **0.L.4 architecture:** memory `project_nexus_infra_lakehouse_phase` (0.L.4 row);

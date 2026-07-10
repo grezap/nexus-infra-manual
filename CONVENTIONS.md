@@ -24,6 +24,11 @@ Every `guides/NN-<slug>.md` has these sections in this order:
 7. **Teardown / reset** — how to cleanly remove what this guide built.
 8. **Troubleshooting** — the real gotchas (drawn from each repo's transient ledger):
    symptom → cause → fix.
+9. **Production tuning** *(engine + OS guides only)* — the system variables a
+   production operator sets that the **lab deliberately does not** (it runs lab-scale on
+   2 GB VMs). This is an **additive reference layer**, explicitly *beyond the lab
+   replica* — it never changes the verbatim lab configs in §5. Format in §6 below.
+   Guides that introduce no tunable engine/OS (e.g. 01 gateway, 03 Vault HA) omit it.
 
 ---
 
@@ -58,6 +63,9 @@ line carries the machine + user, so you always know where your shell is:
 Conventions inside blocks:
 - Show **real values**, not placeholders, wherever the lab has a fixed value (IPs,
   hostnames, paths). Use `<angle-brackets>` only for genuine per-reader secrets.
+  *(Exception: the §9 Production-tuning layer shows recommended production values the
+  lab does **not** use — always paired with the lab's actual value + a "why". That layer
+  is the only place a guide states a value that isn't the verbatim lab render.)*
 - Multi-line files: show the **entire file content** in a `cat > /path <<'EOF'` block,
   then a VERIFY that re-reads it.
 - Secrets (passwords, keys): generate them in-step (`openssl rand -hex 16`, `vault …`)
@@ -89,7 +97,10 @@ Conventions inside blocks:
   shortcuts; the manual lab has the same security as the automated one.
 - **Source of truth:** the canonical topology is
   [`nexus-platform-plan/docs/infra/vms.yaml`](https://github.com/grezap/nexus-platform-plan/blob/main/docs/infra/vms.yaml);
-  configs are the verbatim equivalents of what the automated repos' overlays render.
+  the §5 build configs are the verbatim equivalents of what the automated repos' overlays
+  render. **The §9 Production-tuning layer is the sole, clearly-labelled exception** — it
+  documents production system variables the lab omits (see §6), so a guide can serve both
+  as a 1:1 lab replay *and* as a production reference without the two ever being confused.
 
 ---
 
@@ -99,3 +110,36 @@ No Packer (you install the OS from the ISO), no Terraform (you create + configur
 yourself), no Ansible (you run every package install + write every config file by hand),
 no `vmrun` scripting. Where the automated path uses a Vault Agent to *render* a cert or
 secret, the manual path issues + places it with the `vault` CLI directly.
+
+---
+
+## 6. Production-tuning section format (guide §9)
+
+The lab runs deliberately lab-scale on 2 GB VMs, so its verbatim configs (§5) omit the
+system variables a production deployment must set. Section §9 adds them back as an
+**explicitly-labelled reference layer that does not alter §5**. Rules:
+
+- **Open with the disclaimer:** "Everything below is *beyond the lab replica* — the lab
+  ships the §5 values; this section is what you would change for a production-scale
+  deployment and why. Do not apply these to the 2 GB lab VMs blindly."
+- **One table per subsystem** (OS-layer first, then engine-layer), columns:
+
+  | Setting | Production value | Lab value (§5) | Why it matters |
+  |---|---|---|---|
+
+  - **Setting** — the exact knob (`vm.max_map_count`, `max server memory (MB)`,
+    `shared_buffers`, `maxmemory-policy`), with the file/scope it lives in.
+  - **Production value** — a concrete recommended value *or* a sizing formula
+    (`≈ 25% of RAM`, `50% of (RAM − 1 GB)`), not "tune as needed".
+  - **Lab value (§5)** — what this guide's verbatim config actually sets (or "unset").
+  - **Why it matters** — the mechanism + the failure mode if left at default (1 sentence).
+- **Show the how**, not just the what: for anything that needs a command/file to apply
+  (sysctl drop-in, `limits.conf`, THP unit, `ALTER SYSTEM`, `sp_configure`), give the
+  exact snippet in a fenced block — same rigour as a §5 step, but flagged "production,
+  not applied in the lab".
+- **Flag hard requirements vs optimisations.** A few knobs are engine *requirements*, not
+  tuning (e.g. `vm.max_map_count=262144` for StarRocks, THP-disabled for MongoDB/Redis) —
+  mark these **⚠️ required** so they're never mistaken for optional polish.
+- **OS-layer knobs live once, in Guide 00 §9** (swappiness, overcommit, THP, file-max,
+  somaxconn, `limits.conf`, I/O scheduler). Per-engine guides link back to it and only
+  restate the engine-specific overrides (e.g. Redis needs `overcommit_memory=1`).

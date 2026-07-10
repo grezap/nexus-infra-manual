@@ -508,6 +508,202 @@ Get-Cluster | Remove-Cluster -Force -CleanupAD
 
 ---
 
+## 9. Production tuning — SQL Server (Windows)
+
+> **Everything in this section is *beyond the lab replica*.** The §5 build installs SQL
+> Server 2025 with **stock defaults** — no `max server memory` cap (the instance grabs all
+> RAM), MAXDOP `0`, single-file tempdb, no **Lock Pages in Memory** / **Instant File
+> Initialization** grants, Windows on the *Balanced* power plan — because the lab nodes are
+> modest (FCI `16 GB`, replicas `12 GB`) and a 1:1 replay must not diverge from what the
+> automated `nexus-infra-oltp` overlays render. This section is what you would set on a
+> **production** SQL Server FCI + AG deployment and *why*. **Do not apply these to the lab
+> VMs blindly.** Because this is a **Windows** tier, the OS layer below is the *Windows*
+> equivalent of Guide 00 §9's Linux tuning — **do not link there for the OS knobs**; the
+> mechanisms (power plan, page file, User Rights Assignment) are Windows-native.
+
+> **The FCI vs. AG-replica split matters throughout.** The FCI is **one clustered instance
+> with a single set of system databases on the shared `S:`** — so its `sp_configure`
+> settings (memory, MAXDOP, cost threshold, ad-hoc, backup compression) live in the shared
+> `master` and are **automatically identical** on whichever FCI node owns it. The two AG
+> replicas are **independent standalone instances** — every `sp_configure` value must be set
+> on **each** of them separately to match the FCI. And the **OS-layer** grants (LPIM, IFI,
+> power plan, page file, node-local tempdb paths) are **per-Windows-node** and are **not**
+> shared by the cluster — they must be applied on **all four** nodes. §9.6 is the checklist.
+
+### 9.1 Windows OS layer (per node — all four)
+
+These are host-level and do **not** travel with the clustered instance; apply on each of
+`sql-fci-1`, `sql-fci-2`, `sql-ag-rep-1`, `sql-ag-rep-2`.
+
+```powershell
+# PRODUCTION — not applied in the lab. RDP as NEXUS\nexusadmin, elevated PowerShell.
+
+# --- High Performance power plan (SCHEME_MIN) ---
+powercfg /setactive SCHEME_MIN
+powercfg /getactivescheme          # VERIFY -> "High performance"
+
+# --- Fixed page file on a non-data volume (disable automatic management) ---
+$cs = Get-CimInstance Win32_ComputerSystem
+if ($cs.AutomaticManagedPagefile) {
+    $cs | Set-CimInstance -Property @{ AutomaticManagedPagefile = $false }
+}
+# set an explicit, fixed page file (Initial = Maximum avoids runtime resizing)
+Set-CimInstance -Query "SELECT * FROM Win32_PageFileSetting WHERE Name='C:\\pagefile.sys'" `
+    -Property @{ InitialSize = 16384; MaximumSize = 16384 }   # 16 GB; reboot to apply
+```
+
+Lock Pages in Memory (**SeLockMemoryPrivilege**) and Instant File Initialization
+(**SeManageVolumePrivilege**) are **User Rights Assignments** granted to the *SQL service
+account* — which is **`NEXUS\gmsa-sql-engine$`** on the FCI nodes but **`NT AUTHORITY\NETWORK
+SERVICE`** on the replicas. Grant via `secpol.msc` (**Local Policies → User Rights
+Assignment**) or script it with `secedit` (native; no Resource-Kit `ntrights` needed):
+
+```powershell
+# PRODUCTION — grant LPIM + IFI to THIS node's SQL service account. Run per node,
+# substituting the correct account (GMSA on FCI nodes, NETWORK SERVICE on replicas).
+$acct = 'NEXUS\gmsa-sql-engine$'    # replicas: 'NT AUTHORITY\NETWORK SERVICE'
+$sid  = (New-Object System.Security.Principal.NTAccount($acct)
+        ).Translate([System.Security.Principal.SecurityIdentifier]).Value
+
+$inf = "$env:TEMP\lpim-ifi.inf"; $db = "$env:TEMP\lpim-ifi.sdb"
+secedit /export /cfg "$env:TEMP\cur.cfg" /areas USER_RIGHTS | Out-Null
+# merge *$sid onto the two privilege lines (create them if absent), then re-apply:
+@"
+[Unicode]
+Unicode=yes
+[Privilege Rights]
+SeLockMemoryPrivilege = *$sid
+SeManageVolumePrivilege = *$sid
+[Version]
+signature="`$CHICAGO`$"
+Revision=1
+"@ | Set-Content $inf -Encoding Unicode
+secedit /configure /db $db /cfg $inf /areas USER_RIGHTS
+# NOTE: /configure MERGES rights additively; verify existing holders aren't dropped.
+```
+
+> IFI can alternatively be granted **at install time** with `/SQLSVCINSTANTFILEINIT="True"`
+> on the `setup.exe` line (§5.2.1 / §5.5.1) — the by-hand equivalent of the grant above.
+> Both LPIM and IFI take effect on the **next SQL service (re)start**; on the FCI, cycle the
+> **cluster group** (`Stop-ClusterGroup`/`Start-ClusterGroup "SQL Server (MSSQLSERVER)"`), not
+> `Restart-Service` (§5.7.1).
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| **Lock Pages in Memory** (`SeLockMemoryPrivilege`, per node) | **⚠️ granted** to the SQL service account | not granted | Stops Windows trimming SQL's working set: under memory pressure the OS can page the entire buffer pool to disk, causing sudden latency cliffs and `A significant part of sql server process memory has been paged out` alerts. Pair with a **capped** `max server memory` (§9.2) so LPIM can't starve the OS. |
+| **Instant File Initialization** (`SeManageVolumePrivilege`, per node) | **⚠️ granted** to the SQL service account | not granted | Skips zero-filling **data** files on create/grow/restore — a 100 GB restore or autogrow goes from minutes of zeroing to near-instant. (Does not apply to log files, which are always zeroed.) |
+| Power plan | **High Performance** (`powercfg /setactive SCHEME_MIN`) | unset (*Balanced*) | *Balanced* parks cores and scales CPU frequency down; SQL latency-sensitive workloads see jitter and lower throughput. High Performance pins max frequency. |
+| Page file | **fixed** Initial = Maximum, on a non-data volume | unset (system-managed) | A resizing/fragmented page file adds stalls; with LPIM the buffer pool is never paged, so a modest fixed file (for crash dumps + OS) is enough — but leave one, don't disable it. |
+| NTFS allocation unit (data/log volumes) | **64 KB** | **PRESENT** — `S:` formatted `-AllocationUnitSize 65536` (§5.3.1) | 64 KB matches SQL's 64 KB extent (8×8 KB pages) → fewer I/O ops per extent. Already correct in the lab for the shared LUN; apply the same to any local data/log volume on the replicas. |
+
+### 9.2 Server memory — `max server memory` + `min server memory`
+
+⚠️ **This is the single most important FCI setting.** SQL's default `max server memory` is
+effectively unlimited, so the instance consumes all RAM and leaves nothing for Windows, the
+cluster service, or filesystem cache — and on **failover the instance must fit the passive
+node too**. Leave the OS **~10–20 %, or ≥ 4 GB**, whichever is larger. `min server memory`
+stops Windows reclaiming SQL's pool back down after a spike; with **LPIM** set (§9.1) it also
+defines the floor the pinned pages defend.
+
+```sql
+-- PRODUCTION — not applied in the lab. Run once on the FCI (shared master → both nodes);
+-- run again, independently, on EACH replica with that node's own sizing.
+EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+
+-- FCI nodes are 16 GB → cap SQL at ~12 GB, leaving ~4 GB for Windows + cluster:
+EXEC sp_configure 'max server memory (MB)', 12288; RECONFIGURE;
+EXEC sp_configure 'min server memory (MB)',  4096; RECONFIGURE;
+-- On the 12 GB AG replicas use e.g. max 9216 / min 3072 instead.
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `max server memory (MB)` | RAM − max(≈15 %, 4 GB) — FCI 16 GB → **`12288`**; replica 12 GB → **`9216`** | unset (`2147483647` → takes all RAM) | **⚠️** Uncapped, SQL starves Windows/WSFC → paging, cluster-heartbeat timeouts, hard failovers. **With FCI the cap must also fit the passive node**; with **LPIM** an uncapped instance can lock so much RAM the OS can't function. |
+| `min server memory (MB)` | ≈ 25 % of the max (FCI **`4096`**) | unset (`0`) | Prevents Windows clawing the buffer pool below a useful floor after a memory-pressure spike, avoiding a cold cache and a latency spike while SQL re-reads from disk. |
+
+### 9.3 Parallelism — MAXDOP + cost threshold
+
+```sql
+-- PRODUCTION — FCI: set once (shared master). Replicas: set on each to MATCH.
+EXEC sp_configure 'max degree of parallelism', 4;  RECONFIGURE;   -- see sizing below
+EXEC sp_configure 'cost threshold for parallelism', 50; RECONFIGURE;
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `max degree of parallelism` | **= logical cores per NUMA node, capped at 8** — these nodes are 4 vCPU / 1 NUMA node → **`4`** | unset (`0` = use all cores) | `0` lets one query fan out across *every* core, starving concurrent OLTP requests and inflating `CXPACKET`/`CXCONSUMER` waits. Cap it to the per-NUMA core count (≤ 8) so parallel plans stay within one memory node. |
+| `cost threshold for parallelism` | **`50`** | unset (`5`) | The default `5` is a 1990s value — trivial queries go parallel, paying thread-coordination overhead that makes them *slower* on an OLTP box. Raising to `50` keeps small queries serial and reserves parallelism for genuinely expensive plans. |
+
+### 9.4 tempdb — multiple equal files on fast storage
+
+tempdb allocation contention (PFS/GAM/SGAM latch waits) is a classic OLTP bottleneck; the
+fix is **multiple equal-sized data files** so allocations round-robin across them.
+
+```sql
+-- PRODUCTION — one data file per logical core, up to 8. These nodes = 4 vCPU → 4 files,
+-- all EQUAL size with EQUAL autogrow (unequal sizes defeat proportional-fill round-robin).
+ALTER DATABASE tempdb MODIFY FILE (NAME = tempdev, SIZE = 1024MB, FILEGROWTH = 256MB);
+ALTER DATABASE tempdb ADD FILE (NAME = temp2, FILENAME = 'T:\tempdb\tempdb2.ndf', SIZE = 1024MB, FILEGROWTH = 256MB);
+ALTER DATABASE tempdb ADD FILE (NAME = temp3, FILENAME = 'T:\tempdb\tempdb3.ndf', SIZE = 1024MB, FILEGROWTH = 256MB);
+ALTER DATABASE tempdb ADD FILE (NAME = temp4, FILENAME = 'T:\tempdb\tempdb4.ndf', SIZE = 1024MB, FILEGROWTH = 256MB);
+-- restart the instance for the file layout to take effect (FCI: cycle the cluster group).
+```
+
+> The by-hand equivalent at install is the `setup.exe` tempdb switches:
+> `/SQLTEMPDBFILECOUNT=4 /SQLTEMPDBFILESIZE=1024 /SQLTEMPDBFILEGROWTH=256`
+> (and `/SQLTEMPDBDIR=T:\tempdb`). On the **FCI**, put tempdb on **node-local fast disk**
+> (SQL 2016+ supports FCI tempdb on local storage — it need not sit on the shared `S:`), but
+> the chosen path (`T:\tempdb`) **must exist on both FCI nodes** or the instance won't start
+> after a failover.
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| tempdb data-file count | **`min(vCPU, 8)`** = **`4`** here, all equal-sized | unset (setup default layout) | One tempdb file serialises allocation-page latches under concurrent temp-table/sort/spill load → `PAGELATCH_UP` contention. Multiple equal files spread it. Equal *size + growth* is required for proportional fill to round-robin evenly. |
+| tempdb autogrow | fixed **`256MB`** (not the `%` default), pre-sized large | unset (small file, `%` growth) | Percentage growth grows ever-larger chunks and, without IFI, stalls the instance while zeroing; a fixed MB growth is predictable. Pre-size so growth is rare. |
+| tempdb placement | **local fast NVMe/SSD** per node | shared `S:` (default) | tempdb is write-heavy and disposable; keeping it off the replicated/shared data path removes it from the FCI storage bottleneck. |
+
+### 9.5 Instance options — ad-hoc plans, backup compression, backup-log noise
+
+```sql
+-- PRODUCTION — FCI: set once (shared master). Replicas: set on each to MATCH.
+EXEC sp_configure 'optimize for ad hoc workloads', 1; RECONFIGURE;
+EXEC sp_configure 'backup compression default',    1; RECONFIGURE;
+```
+
+Trace flag **3226** is a **startup** parameter, not `sp_configure`. Set it via **SQL Server
+Configuration Manager → SQL Server (MSSQLSERVER) → Properties → Startup Parameters → add
+`-T3226`** (persists across FCI failover because it is the clustered instance's own
+configuration), then restart the instance (FCI: cycle the cluster group).
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `optimize for ad hoc workloads` | **`1`** | unset (`0`) | Stores only a small *plan stub* on a query's first execution instead of a full plan; stops single-use ad-hoc queries bloating the plan cache and evicting reusable plans. Safe, universally recommended. |
+| `backup compression default` | **`1`** | unset (`0`) | Compresses backups by default → smaller files, **faster** backup/restore (less I/O), and faster AG manual-seed transfers (§5.6.2). Developer edition includes it. |
+| Trace flag **`3226`** (startup `-T3226`) | **enabled** | not set | Suppresses the *successful backup* entry the engine writes to the errorlog on **every** backup; with frequent log backups this spam drowns the errorlog and hides real errors. |
+
+### 9.6 Consistency across all nodes — the production failover trap
+
+A mismatched failover **target** is a real production incident: the workload lands on a node
+whose tuning differs, and behaviour changes silently. Enforce this matrix before go-live.
+
+| Setting | Scope | FCI (`sql-fci-1/2`) | AG replicas (`sql-ag-rep-1/2`) |
+|---|---|---|---|
+| `max server memory` / `min server memory` | **`sp_configure`** | shared `master` → auto-identical across both FCI nodes; still verify each node's **RAM is equal** so the cap fits after failover | ⚠️ **set on each replica independently** — and size to that replica's RAM (12 GB, not 16) |
+| MAXDOP + cost threshold | **`sp_configure`** | auto-identical (shared `master`) | ⚠️ **set on each replica to match the FCI** |
+| `optimize for ad hoc` / `backup compression` / TF `3226` | `sp_configure` + startup param | auto-identical / `-T3226` on the clustered instance | ⚠️ **set on each replica to match** |
+| tempdb file count + sizes + **path** | per-node (files are node-local) | ⚠️ tempdb path (e.g. `T:\tempdb`) **must exist on both** FCI nodes or startup fails post-failover | ⚠️ configure the same file count/sizing on each replica |
+| **LPIM** + **IFI** (User Rights Assignment) | per-Windows-node | ⚠️ **grant on both** FCI nodes to `gmsa-sql-engine$` — the grant does **not** replicate with the cluster | ⚠️ **grant on both** replicas to `NETWORK SERVICE` |
+| Power plan / page file | per-Windows-node | ⚠️ set on **both** | ⚠️ set on **both** |
+
+> **Rule of thumb:** anything in `sp_configure` is *shared* on the FCI (one instance, one
+> `master`) but *not* on the AG replicas (independent instances); anything at the **Windows
+> or file-system layer** (LPIM, IFI, power plan, page file, tempdb paths) is **per-node
+> everywhere** and is the most common thing forgotten on the *passive* FCI node until a
+> failover exposes it. Verify with the §6 smoke plus a `sp_configure` diff between the FCI
+> and each replica.
+
+---
+
 ### Cross-references
 
 - **0.G.7 architecture + transients:** memory `project_nexus_infra_oltp_0g7_phase`; ADR-0026 (iSCSI), ADR-0027 (AG cert endpoints), ADR-0025 (Listener as LB-tier HA)

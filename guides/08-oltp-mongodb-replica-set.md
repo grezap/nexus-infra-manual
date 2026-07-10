@@ -402,6 +402,110 @@ then re-run §5.3–5.4.
 
 ---
 
+## 9. Production tuning — MongoDB
+
+> **Everything below is *beyond the lab replica*.** The §5.3.1 `mongod.conf` is the
+> verbatim lab config — it pins the WiredTiger cache to `0.5` GB, takes the default oplog
+> and concern levels, and runs on 2 GB / 2-vCPU VMs where those defaults keep the guide a
+> faithful 1:1 replay. This section is what you would change on a **production** MongoDB
+> replica-set member and *why*. **Do not paste these onto the 2 GB lab VMs blindly** — the
+> cache and oplog sizes assume production-sized hosts and disks. The **OS layer** (kernel
+> `sysctl`, THP, filesystem, ulimits, I/O scheduler) lives once in
+> **[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)**;
+> only the MongoDB-specific overrides are restated here.
+
+### 9.1 WiredTiger cache
+
+The lab caps the internal cache at `0.5` GB so three data engines coexist on a 2 GB node.
+In production this is the biggest performance lever — but bigger is **not** always better,
+because WiredTiger also leans on the OS filesystem cache for compressed blocks.
+
+```yaml
+# PRODUCTION mongod.conf — WiredTiger cache (not applied in the lab).
+storage:
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: 15.5   # e.g. 50% of (32 GB - 1 GB); size to YOUR host's RAM
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `storage.wiredTiger.engineConfig.cacheSizeGB` | `≈ 50% of (RAM − 1 GB)` (mongod's own default formula) | **`0.5` (§5.3.1)** | The internal WiredTiger cache holds uncompressed working-set pages. Too large starves the OS page cache (which WiredTiger uses for *compressed* blocks) and risks OOM on a shared host; too small forces constant eviction + disk reads. The lab pins `0.5` only so three engines fit a 2 GB node. |
+
+### 9.2 OS layer — THP, filesystem, readahead, swappiness, ulimits  ⚠️
+
+MongoDB is the most OS-opinionated engine in the fleet: it **logs startup warnings** for
+THP, non-XFS filesystems on some setups, and high readahead. These live once in
+**[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)**; restated here because they are MongoDB-driven.
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| Transparent Huge Pages | **`never`** | unset (`madvise`/`always`) | **⚠️ required by MongoDB** — logs a startup warning; THP's `khugepaged` compaction causes latency spikes and RSS bloat under WiredTiger's access pattern. Guide 00 §9.2. |
+| Filesystem | **XFS** for the `dbPath` | ext4 (lab default) | **⚠️ recommended by MongoDB** — WiredTiger on XFS avoids ext4 write-stall pathologies at high concurrency; MongoDB's own production checklist calls for XFS. Guide 00 §9.4. |
+| `read_ahead_kb` (block device) | low (`0`–`128`) | unset (`128`–`256`) | MongoDB's random-access pattern wastes bandwidth on large readahead pulling pages it won't use. Guide 00 §9.4. |
+| `vm.swappiness` (sysctl) | `1` | unset (`60`) | Keeps the WiredTiger cache resident; the default `60` lets the kernel swap hot pages under cache pressure → latency cliffs. Guide 00 §9.1. |
+| `nofile` (open files) | `64000` | **`64000` via `LimitNOFILE=` (§5.1.2 unit)** | Already set on the `nexus-mongo` unit — a busy mongod with many connections + data/journal files exhausts the default `1024` soft limit → refused connections. Note: `limits.conf` is ignored for systemd services, so it lives on the **unit**. |
+| `nproc` / `memlock` | raised / high | unset | WiredTiger spawns many threads; MongoDB recommends lifting the per-user process cap (and `memlock` where memory is pinned). Guide 00 §9.3. |
+
+### 9.3 Oplog sizing
+
+```yaml
+# PRODUCTION mongod.conf — oplog (set at first init; resize a running set with replSetResizeOplog).
+replication:
+  replSetName: nexus-rs
+  oplogSizeMB: 51200   # 50 GB; size to cover peak-write-rate x longest replica downtime
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `replication.oplogSizeMB` | size for the **peak write window**, not the 5%-of-disk default (default = 5% of free disk, capped 50 GB) | unset (default 5% of disk) | The oplog is the capped replication log every SECONDARY tails. A member offline (or lagging) longer than the oplog **time window** falls off and needs a full, expensive **initial sync**. On a small disk 5% may be only minutes of writes — size it to cover your longest expected maintenance/backup window at peak write rate. Resize a live set with `db.adminCommand({replSetResizeOplog:1, size:51200})` (no restart). |
+
+### 9.4 Durability — cluster-wide write & read concern defaults
+
+```javascript
+// PRODUCTION — run once on the PRIMARY; cluster-wide concern defaults (not applied in the lab).
+db.adminCommand({
+  setDefaultRWConcern: 1,
+  defaultWriteConcern: { w: "majority", j: true },
+  defaultReadConcern:  { level: "majority" }
+})
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| cluster-wide default **write** concern | `{ w: "majority", j: true }` | unset (server default `w:"majority"` since 5.0; `j` per-op) | Guarantees an acknowledged write is journaled on a **majority** of members before returning — so it survives a PRIMARY failover without a rollback. 5.0+ already defaults `w:majority`; set it explicitly **plus** `j:true` to also require the on-disk journal flush. |
+| default **read** concern | `majority` | unset (`local`) | `local` reads can surface writes that later **roll back** during a failover; `majority` returns only majority-committed data. §5.4.4's smoke already reads per-query with `readConcernLevel=majority` — this makes it the cluster-wide default so every client gets it. |
+
+### 9.5 NUMA
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `numactl --interleave=all` (launch wrapper) | wrap the `mongod` launch on multi-socket hosts | not used (single-socket lab VMs) | **⚠️ recommended by MongoDB on NUMA hardware** — without interleaving, mongod's memory lands on one NUMA node and cross-node access + zone-reclaim thrashing tank performance; mongod logs a NUMA warning at startup. Pair with `vm.zone_reclaim_mode=0` (usually the default). |
+
+```ini
+# PRODUCTION — /etc/systemd/system/nexus-mongo.service.d/10-numa.conf (multi-socket hosts only).
+[Service]
+ExecStart=
+ExecStart=/usr/bin/numactl --interleave=all /usr/bin/mongod --config /etc/nexus-mongo/mongod.conf
+```
+
+### 9.6 Networking — wire compression + connection ceiling
+
+```yaml
+# PRODUCTION mongod.conf — networking (not applied in the lab).
+net:
+  compression:
+    compressors: zstd,snappy   # prefer zstd's higher ratio on the replication backplane
+  maxIncomingConnections: 20000
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `net.compression.compressors` | `zstd,snappy` (list `zstd` first to prefer its ratio) | unset (server default: `snappy` offered) | Compresses both client and **intra-cluster replication** traffic on the wire — a real bandwidth saving for replication fan-out across the backplane. `zstd` trades a little CPU for a markedly better ratio than `snappy`; the peers negotiate the best mutually-supported codec. |
+| `net.maxIncomingConnections` | a realistic ceiling above your total driver pool sizes (default `65536`) | unset (`65536`) | Caps concurrent incoming connections. The default is effectively unlimited, and each connection costs a thread + ~1 MB stack — a connection storm from a misconfigured driver pool can exhaust threads/RAM before the DB itself is stressed. |
+
+---
+
 ### Cross-references
 
 - **Network canon:** `nexus-platform-plan/docs/infra/network.md` (Mongo `.71`–`.73`)

@@ -7,13 +7,19 @@ those use **Packer + Terraform + Ansible** to stand up the lab, this repo shows 
 build the **exact same lab — the same VMs, IPs, MACs, on-disk configs, and full
 Vault-PKI mTLS — entirely by hand**, one command at a time.
 
-It is two things at once:
+It is three things at once:
 
 1. **A runbook** — follow it top-to-bottom and you end up with a cluster byte-for-byte
    equivalent to what the automation produces.
 2. **A teaching document** — every component is explained (what it is, why we use it,
    what it would otherwise be), and **every command** records **WHERE** it runs (which
    machine + user), **WHY** it's needed, the **EXPECTED** result, and how to **VERIFY** it.
+3. **A production reference** — the engine + OS guides each close with a **§9 Production
+   tuning** section: the kernel/OS and engine system variables a production deployment
+   sets (the lab runs deliberately lab-scale on 2 GB VMs and omits them), in a
+   `production value · lab value · why` format. It's an *additive* layer that never
+   changes the verbatim §5 lab build — so a guide is a 1:1 replay **and** a
+   production tuning reference at the same time.
 
 No Terraform. No Ansible. No Packer. No `vmrun`/clone automation. You create the VMs in
 the VMware GUI, install the OS from the ISO, and configure every service by hand.
@@ -57,3 +63,9 @@ Harbor HA), the **Observability** tier (20: Grafana LGTM — 14 nodes + 2 VRRP
 VIPs), and the two **Sharding** tiers (21: Vitess/MySQL; 22: Citus/PostgreSQL).
 The entire NexusPlatform infrastructure layer — host networking through database
 sharding — is now reproducible **entirely by hand**, one command at a time.
+
+**Kept current (2026-07-10):** Guide 12 (sharded MongoDB) now documents the **0.N.1 wire
+mTLS** layer (`requireTLS` + per-host `mongo-sharded-server` Vault-PKI leaves); Guide 21
+(Vitess) documents the **0.O.1 engine-native `file` BackupStorage** (BackupShard /
+RestoreFromBackup on NFS + xtrabackup). Guide 00 (OS layer) and **every engine guide
+(06–22)** now carry a **§9 Production tuning** reference layer (see `CONVENTIONS.md` §6).

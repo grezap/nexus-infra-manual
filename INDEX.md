@@ -20,7 +20,7 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 09 | ✅ [OLTP · Percona XtraDB Cluster](./guides/09-oltp-percona-xtradb-cluster.md) | 3 PXC (Galera) + 2 ProxySQL + **VRRP VIP** (keepalived) | 5 | deb13 | `nexus-infra-oltp` |
 | 10 | ✅ [OLTP · Patroni PostgreSQL HA](./guides/10-oltp-patroni-postgresql-ha.md) | 3 Patroni + 3 etcd + 2 HAProxy + VRRP VIP | 8 | deb13 | `nexus-infra-oltp` |
 | 11 | ✅ [OLTP · SQL Server FCI + Always-On AG](./guides/11-oltp-sqlserver-fci-ag.md) | WSFC + iSCSI shared storage FCI + AG listener | 4 | ws2025 | `nexus-infra-oltp` |
-| 12 | ✅ [OLTP · MongoDB sharded](./guides/12-oltp-mongodb-sharded.md) | 3 config RS + 2 shard RS (×3) + 2 mongos | 11 | deb13 | `nexus-infra-oltp` |
+| 12 | ✅ [OLTP · MongoDB sharded](./guides/12-oltp-mongodb-sharded.md) | 3 config RS + 2 shard RS (×3) + 2 mongos; keyFile member auth + **wire mTLS x509** (0.N.1) | 11 | deb13 | `nexus-infra-oltp` |
 | 13 | ✅ [Analytics · ClickHouse](./guides/13-analytics-clickhouse.md) | 3 shards × 2 replicas + 3-node ClickHouse Keeper | 9 | deb13 | `nexus-infra-analytics` |
 | 14 | ✅ [Analytics · StarRocks (shared-nothing)](./guides/14-analytics-starrocks-shared-nothing.md) | 3 FE (BDB-JE quorum) + 3 BE (tablet sharding/replication) | 6 | deb13 | `nexus-infra-analytics` |
 | 15 | ✅ [Analytics · StarRocks (shared-data)](./guides/15-analytics-starrocks-shared-data.md) | 3 FE + 2 CN on `run_mode=shared_data`, MinIO storage volume (needs Guide 16 first) | 5 | deb13 | `nexus-infra-analytics` |
@@ -29,10 +29,18 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 18 | ✅ [Lakehouse · Spark HA](./guides/18-lakehouse-spark-ha.md) | 2 Spark masters (ZooKeeper-elected HA) + 3-node ZK quorum + 3 workers; Iceberg/S3 client — proves the Spark→Nessie→MinIO write path | 8 | deb13 | `nexus-infra-lakehouse` |
 | 19 | ✅ [Registry · Harbor HA](./guides/19-registry-harbor-ha.md) | 2 stateless Harbor app nodes (RR-DNS) + PG 17/Redis HA datastore (keepalived VRRP VIP `.119`), MinIO `s3://harbor` blobs, Trivy + cosign, Vault OIDC SSO | 4 | deb13 | `nexus-infra-registry` |
 | 20 | ✅ [Observability · Grafana LGTM](./guides/20-observability-grafana-lgtm.md) | Prometheus HA + Alertmanager mesh + Loki + Tempo (MinIO) + Grafana HA over shared PG + OTel Collector + fleet Vector; 2 VRRP VIPs (`.184/.185`) | 14 | deb13 | `nexus-infra-observability` |
-| 21 | ✅ [Sharding · Vitess (MySQL)](./guides/21-sharding-vitess-mysql.md) | 3 etcd topo + vtctld/VTOrc + 2 vtgate + 2 shards × 3 Percona 8.4 tablets; hash-vindex sharding, full mTLS, VTOrc auto-reparent | 12 | deb13 | `nexus-infra-vitess` |
+| 21 | ✅ [Sharding · Vitess (MySQL)](./guides/21-sharding-vitess-mysql.md) | 3 etcd topo + vtctld/VTOrc + 2 vtgate + 2 shards × 3 Percona 8.4 tablets; hash-vindex sharding, full mTLS, VTOrc auto-reparent, **engine-native `file` BackupStorage** (0.O.1) | 12 | deb13 | `nexus-infra-vitess` |
 | 22 | ✅ [Sharding · Citus (PostgreSQL)](./guides/22-sharding-citus-postgresql.md) | 3 etcd DCS + coordinator Patroni pair + 2 worker Patroni pairs + 3 keepalived VIPs (VIP-follows-leader); 32-shard distributed table, full mTLS | 9 | deb13 | `nexus-infra-citus` |
 
 **Total: 23 guides · 140 VMs · the full infrastructure layer, by hand. ✅ ALL 23 COMPLETE.**
+
+> 🛠 **Production-tuning layer (§9).** Guide 00 (the OS layer) and **every engine guide
+> (06–22)** each carry a **§9 Production tuning** section — the system variables a production operator
+> sets that the deliberately lab-scale (2 GB) configs omit, in a `production value · lab
+> value · why` format. It is an **additive reference layer** (see [`CONVENTIONS.md`](./CONVENTIONS.md)
+> §6/§9) and never changes the verbatim §5 lab build, so each guide is both a 1:1 lab
+> replay *and* a production reference. The OS layer lives once in **Guide 00 §9**; engine
+> guides link back to it and add only their engine-specific knobs.
 
 > ⚠️ **One out-of-numeric-order dependency:** build **Guide 16 (MinIO) BEFORE Guide 15
 > (StarRocks shared-data)** — 15's `run_mode=shared_data` stores its data in a MinIO
@@ -48,4 +56,6 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 - Every guide follows [`CONVENTIONS.md`](./CONVENTIONS.md) (the step-block format +
   global lab facts) so the format never drifts.
 - Commands + configs are sourced **verbatim from the automated repos** (the rendered
-  configs the overlays produce) so the manual path is a true 1:1 replay.
+  configs the overlays produce) so the manual path is a true 1:1 replay. The one exception
+  is each guide's **§9 Production tuning** layer, which is explicitly labelled *beyond the
+  lab replica* and documents production values the lab does not use (see `CONVENTIONS.md` §6).

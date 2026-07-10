@@ -981,6 +981,116 @@ for ip in 170 171; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable --no
 
 ---
 
+## 9. Production tuning — Grafana LGTM stack
+
+> **Everything below is *beyond the lab replica*.** The §5 configs run the four engines at
+> lab-scale on 2 GB VMs with essentially default resource limits — enough to prove the ring
+> forms and data flows, not to survive real ingest volume. This section is what you would set
+> on a **production** LGTM stack, and *why*. **Do not paste these onto the 2 GB lab VMs
+> blindly** — the ingester/query limits below assume production-sized RAM.
+>
+> **Retention is already handled — don't duplicate it.** The lab *does* set retention where
+> it matters: Loki `limits_config.retention_period: 168h` + `reject_old_samples_max_age: 168h`
+> (§5.2.1) and Tempo `compactor.compaction.block_retention: 168h` (§5.3.1). Production would
+> raise those to your compliance window (e.g. `720h`/30 d), but the *mechanism* is present —
+> §9 adds the **resource/throughput** knobs the lab omits, not more retention.
+
+### 9.1 Prometheus (`prom-1/2`, systemd flags)
+
+Prometheus tuning is on the **binary's CLI flags** (the `nexus-prometheus.service`
+`ExecStart`, §5.1.1) and `global` block, not a config table. Add these flags:
+
+```ini
+# PRODUCTION — nexus-prometheus.service ExecStart deltas. Not applied in the lab.
+--storage.tsdb.retention.time=30d          # lab: unit default (~15d)
+--storage.tsdb.retention.size=80GB         # lab: unset — cap to ~80% of the TSDB volume
+--storage.tsdb.wal-compression             # lab: on by default (2.55) — keep it
+--query.max-samples=50000000               # lab: default 50M — raise for wide range queries
+--query.max-concurrency=40                 # lab: default 20 — more parallel query slots
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `--storage.tsdb.retention.time` | `30d` (or your window) | unit default (~`15d`) | Time-based TSDB retention. Longer history costs disk; set it deliberately rather than drifting on the 15 d default. |
+| `--storage.tsdb.retention.size` | `80GB` (≈80 % of the volume) | unset | **Size cap is the safety net** — whichever of time/size hits first wins. Without it a scrape-cardinality spike can fill the disk and wedge Prometheus (no writes → gaps). |
+| `--storage.tsdb.wal-compression` | enabled | on by default (2.55) | Halves WAL disk + replay time; effectively free. Confirm it's on (it is, by default, in 2.55) rather than relying on it silently. |
+| `--query.max-samples` | `50000000`+ | default `50000000` | Ceiling on samples a single query may load; too low fails big dashboards with `query processing would load too many samples`, too high lets one query OOM the process. |
+| `--query.max-concurrency` | `40` | default `20` | Concurrent query slots; raise on a busy Grafana front-end so dashboards don't queue, but keep it bounded so a query storm can't exhaust RAM. |
+| `global.scrape_interval` / `evaluation_interval` | `15s`–`30s` per SLO | `30s` (§5.1.2) | Finer intervals = more resolution but linearly more series churn + TSDB size. `30s` is a sane lab/most-prod default. |
+
+### 9.2 Loki (`loki-1/2/3` — `limits_config` + ingester, §5.2.1)
+
+The lab's `limits_config` carries only the retention/validation knobs; production adds
+**rate + cardinality limits** (the guardrails against one noisy tenant/stream) and **chunk
+sizing**:
+
+```yaml
+# PRODUCTION loki.yaml deltas — all 3 nodes. Not applied in the lab.
+limits_config:
+  # (lab already sets: reject_old_samples, reject_old_samples_max_age:168h, retention_period:168h)
+  ingestion_rate_mb: 16            # lab: default 4  — per-tenant sustained ingest MB/s
+  ingestion_burst_size_mb: 32      # lab: default 6
+  max_streams_per_user: 100000     # lab: default 10000 — cardinality guard
+  per_stream_rate_limit: 5MB       # lab: default 3MB
+  per_stream_rate_limit_burst: 20MB
+  max_global_streams_per_user: 0   # 0 = rely on per-user
+ingester:
+  chunk_target_size: 2097152       # lab: default 1572864 (1.5MB) — bigger chunks, fewer S3 objects
+  # lab already sets: chunk_idle_period:30s, max_chunk_age:2h, wal.enabled:true
+```
+
+| Setting | Production value | Lab value (§5.2.1) | Why it matters |
+|---|---|---|---|
+| `ingestion_rate_mb` / `ingestion_burst_size_mb` | `16` / `32` | default `4` / `6` | Per-tenant ingest throttle. The `4 MB/s` default silently `429`s a real app's log burst (`Ingestion rate limit exceeded`); size it to peak log volume. |
+| `max_streams_per_user` | `100000` | default `10000` | **Cardinality guard** — each label combination is a stream; a bad `path`/`uuid` label explodes streams and OOMs ingesters. Raise deliberately, and fix the labels. |
+| `per_stream_rate_limit` (+ burst) | `5MB` (+`20MB`) | default `3MB` | Caps a *single* hot stream so it can't starve others; the per-stream complement to the per-tenant limit. |
+| `chunk_target_size` | `2 MB` (`2097152`) | default `1.5 MB` | Larger flushed chunks = fewer, bigger S3 objects → cheaper object-store ops + faster queries. Trade-off is more ingester RAM held before flush. |
+| ingester `chunk_idle_period` / `max_chunk_age` / `wal` | as lab | **PRESENT** (`30s`/`2h`/WAL on) | The lab already tunes flush cadence + WAL durability (T12); noted so it's not re-set. |
+
+### 9.3 Tempo (`tempo-1/2/3` — ingester + block sizing, §5.3.1)
+
+```yaml
+# PRODUCTION tempo.yaml deltas — all 3 nodes. Not applied in the lab.
+ingester:
+  max_block_bytes: 524288000       # lab: default (~100MB effective) — flush bigger blocks
+  max_block_duration: 30m          # lab: 5m — fewer, larger blocks under real trace volume
+  # (lab keeps replication_factor:3, interface_names:["nic1"])
+# lab already sets: compactor.compaction.block_retention:168h
+```
+
+| Setting | Production value | Lab value (§5.3.1) | Why it matters |
+|---|---|---|---|
+| `ingester.max_block_bytes` | `524288000` (500 MB) | default | Cut/flush a block when it reaches this size. Bigger blocks = fewer S3 objects + more efficient compaction; too big raises ingester RAM + replay time on restart. |
+| `ingester.max_block_duration` | `30m` | `5m` | The lab flushes every 5 min to make traces queryable fast; production raises it so low-volume ingesters don't spray tiny blocks into `s3://tempo`. |
+| `compactor.compaction.block_retention` | your window (e.g. `720h`) | **`168h`** — PRESENT | Trace retention is already set (§5.3.1); raise only for a longer window. |
+| `max_bytes_per_trace` (overrides) | e.g. `50MB` | unset (unbounded) | Caps a single runaway trace so one pathological request can't blow up an ingester. |
+
+### 9.4 Grafana's shared PostgreSQL
+
+Grafana's dashboards/users/annotations live in its shared **PostgreSQL** back end (the
+streaming-repl + keepalived pair this guide reuses from §5.4 of Guides 17/19). Tune it as a
+normal OLTP node — **[Guide 10 §9](./10-oltp-patroni-postgresql-ha.md)** — `shared_buffers`,
+`effective_cache_size`, `work_mem`, checkpoint/WAL. It's a light workload (config store, not
+telemetry), so modest sizing suffices, but the lab's PG defaults still want the Guide 10
+treatment before heavy multi-user dashboard load.
+
+### 9.5 OS layer — file descriptors for the ingesters
+
+Loki, Tempo, and Prometheus ingesters each hold **thousands of open files** (WAL segments,
+local chunk cache, S3 connection sockets, TSDB blocks). Apply the Guide 00 §9 OS layer on
+all fourteen nodes — in particular **`nofile`** (soft `65536` / hard `1048576`) via
+`limits.conf` **and** the systemd `DefaultLimitNOFILE` drop-in (systemd services ignore
+`limits.conf`), or the ingesters hit the `1024` default and fail with `too many open files`
+mid-ingest. See **[Guide 00 §9](./00-lab-host-and-base-vm.md)** for the exact sysctl +
+`limits.conf` + `system.conf.d` snippets.
+
+| Setting | Production value | Lab value | Why it matters |
+|---|---|---|---|
+| `nofile` (per ingester service) | soft `65536` / hard `1048576` | default `1024` | WAL + chunk cache + S3 sockets exhaust the default FD limit under real ingest → dropped writes / crash. Set via systemd unit or `DefaultLimitNOFILE` (Guide 00 §9), not `limits.conf` alone. |
+| `vm.max_map_count` | `262144` | default `65530` | Prometheus/Loki mmap many TSDB/chunk files; the default map-count ceiling can be hit on large TSDBs. Set in Guide 00 §9's sysctl drop-in. |
+
+---
+
 ### Cross-references
 
 - **0.I architecture:** memory `project_nexus_infra_observability_phase`; ADR-0038

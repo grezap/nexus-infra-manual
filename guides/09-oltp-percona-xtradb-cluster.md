@@ -524,6 +524,70 @@ for ip in 53 52 51; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable --n
 
 ---
 
+## 9. Production tuning — Percona XtraDB Cluster / Galera
+
+> **Everything below is *beyond the lab replica*.** The §5 `my.cnf`/`wsrep.cnf` are
+> what the lab actually ships — 8 GB PXC VMs sized to *form the cluster and prove
+> synchronous Galera replication + mTLS*, not to carry production write load. This
+> section is what you would change on a **production** PXC deployment and why. It does
+> **not** alter the §5 renders. **Do not paste these onto the lab VMs blindly** — the
+> buffer-pool and gcache sizes assume production-sized RAM.
+>
+> **OS layer first.** A production PXC host also needs the kernel / ulimit / THP tuning in
+> [Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)
+> — set that once per host, then add the engine overrides below. Two of its knobs are
+> re-flagged in §9.3 because PXC is one of the engines that hard-needs them (**THP off**,
+> **`vm.swappiness=1`**).
+
+### 9.1 InnoDB — memory, redo log & I/O (`[mysqld]` in `/etc/nexus-percona/my.cnf`)
+
+```ini
+# PRODUCTION — not applied in the lab. Sized here for an 8-vCPU / 64 GB dedicated PXC node.
+[mysqld]
+innodb_buffer_pool_size        = 46G          # ~70-75% of RAM on a dedicated node
+innodb_buffer_pool_instances   = 8            # 1 instance per ~1-2 GB of pool, cap ~8
+innodb_flush_log_at_trx_commit = 1            # full durability (see the tradeoff below)
+innodb_flush_method            = O_DIRECT     # already set in §5.3.1 — keep it
+innodb_redo_log_capacity       = 4G           # 8.0.30+ single knob (replaces innodb_log_file_size)
+innodb_io_capacity             = 2000         # SSD baseline background flush rate
+innodb_io_capacity_max         = 4000         # SSD burst ceiling
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `innodb_buffer_pool_size` | **≈ 70-75 % of RAM** on a dedicated node (e.g. `46G` on 64 GB) | `1G` | The hot working set (data + index pages) lives here; too small ⇒ every read/write hits disk. The single most important MySQL knob. Leave ~25 % for the OS page cache, per-connection buffers, and Galera's gcache. |
+| `innodb_buffer_pool_instances` | `8` (once the pool is >1 GB) | unset (`1`) | Splits the pool into N independent mutex-guarded arenas so concurrent threads don't serialise on one buffer-pool mutex — real throughput on many-core boxes. Size so each instance is ≥1 GB. |
+| `innodb_flush_log_at_trx_commit` | **`1`** (flush + fsync the redo log at every commit) | `2` | ⚠️ **Durability tradeoff — read this.** `2` (lab) writes the redo log to the OS cache at commit but only fsyncs once/second, so a **host crash / power loss can lose ~1 s of committed transactions on that node**. The lab accepts `2` *only* because Galera synchronously replicates every write-set to all 3 nodes before commit, so a single node's lost second is normally recoverable from a peer — it is a lab-scale write-throughput shortcut, **not** a durability guarantee. Production that must survive a simultaneous multi-node power event (or that runs a smaller cluster) sets **`1`**: D-safe, at the cost of one fsync per commit (mitigated by a battery-backed / NVMe write cache and group commit). |
+| `innodb_redo_log_capacity` | **≥ 1-2 GB** (e.g. `4G` write-heavy) | `innodb_log_file_size = 256M` | The redo log absorbs write bursts between checkpoints; too small ⇒ constant "furious flushing" checkpoint stalls under load. On Percona/MySQL **8.0.30+** set the single `innodb_redo_log_capacity` (it supersedes `innodb_log_file_size`/`innodb_log_files_in_group`); on older 8.0 use `innodb_log_file_size = 1G` (×2 files). |
+| `innodb_flush_method` | `O_DIRECT` | **PRESENT** (`O_DIRECT`, §5.3.1) | Bypasses the OS page cache for data/redo files so pages aren't double-buffered (once in InnoDB's pool, once in the kernel). Already correct in the lab config — no change. |
+| `innodb_io_capacity` / `innodb_io_capacity_max` | `2000` / `4000` (SATA/NVMe SSD) | unset (`200`/`2000`) | Tells InnoDB how many IOPS the storage can sustain so background flushing + purge keep up with the redo log; the default `200` assumes a single spinning disk and throttles a fast SSD into checkpoint stalls. |
+
+### 9.2 Galera / wsrep — parallel apply & flow control (`/etc/nexus-percona/wsrep.cnf`)
+
+```ini
+# PRODUCTION — not applied in the lab. Tune to the node's core count + write working-set.
+[mysqld]
+wsrep_slave_threads     = 8      # = number of CPU cores (parallel write-set apply)
+wsrep_provider_options  = "gcache.size=8G; gcache.recover=yes; gcs.fc_limit=512; gcs.fc_factor=0.8"
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `wsrep_slave_threads` | **= CPU core count** (e.g. `8`) | unset (`1`) | Applier threads that replay incoming write-sets in parallel. With `1`, a busy writer node out-paces the appliers on the others → replication lag → flow-control pauses that throttle the *whole* cluster to the slowest node. Match it to cores. |
+| `gcache.size` | **sized to the write working-set** (e.g. `8G` — enough to hold the write-sets produced during the longest expected node outage) | `512M` | The on-disk ring buffer of recent write-sets. If a node is away longer than gcache can cover, its rejoin needs a **full SST** (blocking `xtrabackup` clone of the whole dataset) instead of a cheap **IST** (just the missing write-sets). Size it to `write-rate × max-node-downtime`. |
+| `gcs.fc_limit` / `gcs.fc_factor` | `512` / `0.8` (raise from defaults `16` / `0.5` for write-heavy clusters) | unset (defaults) | Galera **flow control**: when a node's receive queue exceeds `fc_limit` write-sets it pauses the cluster until it drains to `fc_limit × fc_factor`. The default `16` is tiny — a momentarily-slow node stalls every writer. Raising the limit lets a node fall further behind before it halts the cluster, trading a little more failover-window lag for far fewer whole-cluster write pauses. Pair with more `wsrep_slave_threads` so nodes drain faster. |
+| `pxc_strict_mode` | `ENFORCING` | **PRESENT** (`ENFORCING`, §5.3.1) | Rejects Galera anti-patterns (MyISAM writes, PK-less tables, explicit `LOCK TABLES`) at write time rather than letting them silently diverge the cluster. Already correct — keep it in production. |
+
+### 9.3 OS-layer requirements for PXC (set per [Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier))
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| Transparent Huge Pages | **`never`** | unset | ⚠️ **required** — THP's `khugepaged` compaction causes multi-ms allocation stalls against InnoDB's buffer-pool access pattern. Disable via the `disable-thp` unit in Guide 00 §9.2. |
+| `vm.swappiness` | `1` | unset (`60`) | Keeps the InnoDB buffer pool + gcache resident; swapping them out under cache pressure turns every "cache hit" into a disk read. Guide 00 §9.1. |
+| `nofile` (open files) | soft `65536` / hard `1048576` | **PRESENT** (`LimitNOFILE=1048576` on `nexus-percona.service`, §5.1.2) | A PXC node with hundreds of connections + data files + SST sockets exhausts the default `1024` soft limit → `Too many open files`. The lab already grants this in the systemd unit — no change needed. |
+
+---
+
 ### Cross-references
 
 - **Network canon:** `nexus-platform-plan/docs/infra/network.md` (Percona `.50`–`.55`, VIP `.50`); ADR-0025 (LB-tier HA)

@@ -1464,6 +1464,157 @@ operator memory). Symptom → cause → fix.
 
 ---
 
+## 9. Production tuning — the OS layer (feeds every Linux tier)
+
+> **Everything in this section is *beyond the lab replica*.** The lab's base image (and
+> the automated `nexus-infra-vmware` overlays) deliberately ship **none** of these — the
+> VMs are 2 GB and lab-scale, so the defaults are fine and staying at defaults keeps the
+> guides a faithful 1:1 replay. This section is what you would set on a **production**
+> Debian host that runs any of the data engines in Guides 07–22, and *why*. Every later
+> Linux guide's §9 links back here for the OS layer and only adds its engine-specific
+> overrides. **Do not paste these onto the 2 GB lab VMs blindly** — several (e.g. large
+> `nofile`, static hugepages) assume production-sized RAM.
+
+Apply as a dedicated node role: a host that runs a database gets this tuning; the gateway
+and pure app nodes generally don't need most of it. Where the lab already sets a value for
+one node (e.g. the gateway's `net.core.somaxconn=4096` in Guide 01), that's noted.
+
+### 9.1 Kernel parameters (`sysctl`)
+
+Drop them in a single file so they survive reboots and are easy to audit:
+
+```bash
+# PRODUCTION — not applied in the lab. Run as root on a dedicated DB host.
+cat > /etc/sysctl.d/90-nexus-tuning.conf <<'EOF'
+# --- memory ---
+vm.swappiness = 1
+vm.overcommit_memory = 1
+vm.max_map_count = 262144
+vm.dirty_background_ratio = 5
+vm.dirty_ratio = 15
+# --- networking (high connection count) ---
+net.core.somaxconn = 4096
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.ip_local_port_range = 1024 65535
+# --- files / handles ---
+fs.file-max = 2097152
+fs.nr_open = 2097152
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 8192
+kernel.pid_max = 4194304
+EOF
+sysctl --system      # load now; VERIFY: sysctl vm.max_map_count -> 262144
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `vm.swappiness` | `1` | unset (`60`) | Keeps DB working-set pages in RAM; `60` lets the kernel swap out hot pages under cache pressure → latency cliffs. `1` (not `0`) still allows swap as a last resort before the OOM-killer. |
+| `vm.overcommit_memory` | `1` | unset (`0`) | **⚠️ required by Redis** (§07) and any forking allocator (`BGSAVE`, `fork()` for backups) — with `0` the fork's worst-case COW reservation is refused and the save fails. Safe on a dedicated DB host. |
+| `vm.max_map_count` | `262144` | unset (`65530`) | **⚠️ required by StarRocks BE** (§14/§15) and heavy mmap engines; the default exhausts memory-map areas under load → `BE` crash / `Cannot allocate memory`. Harmless to raise elsewhere. |
+| `vm.dirty_background_ratio` / `vm.dirty_ratio` | `5` / `15` | unset (`10`/`20`) | Smaller dirty-page pools mean writeback starts earlier and flush stalls are shorter — avoids multi-second write pauses on a busy DB when the kernel dumps a huge dirty pool at once. |
+| `net.core.somaxconn` | `4096` | unset on DB nodes (gateway sets `4096`) | Listen-accept backlog. Engines like Redis/PG open a `511`/`128`-deep listen queue and **warn/clamp** if `somaxconn` is lower → dropped connections in a connect storm. |
+| `net.core.netdev_max_backlog`, `tcp_max_syn_backlog` | `16384`, `8192` | unset | Absorb bursts of inbound packets/SYNs before the kernel drops them — matters on cluster backplanes doing replication fan-in. |
+| `net.ipv4.tcp_tw_reuse`, `tcp_fin_timeout`, `tcp_keepalive_time` | `1`, `15`, `300` | unset | Recycle `TIME_WAIT` sockets and detect dead peers faster on chatty short-lived connections (ProxySQL, mongos, pgbouncer-style fan-out). |
+| `net.ipv4.ip_local_port_range` | `1024 65535` | unset (`32768 60999`) | Widens the ephemeral-port pool so a proxy/router node making thousands of outbound backend connections doesn't exhaust ports. |
+| `fs.file-max`, `fs.nr_open` | `2097152` | unset (RAM-derived) | System-wide and per-process ceilings for open FDs; must be ≥ the `nofile` ulimit you grant below or the ulimit is silently capped. |
+| `fs.inotify.max_user_watches` | `524288` | unset (`~65k`) | Agents/exporters/log shippers (Vector, node_exporter) watch many files; the default runs out → "no space left on device" from inotify. |
+
+### 9.2 Transparent Huge Pages (THP)
+
+```bash
+# PRODUCTION — disable THP at boot (survives reboot; no GRUB edit needed).
+cat > /etc/systemd/system/disable-thp.service <<'EOF'
+[Unit]
+Description=Disable Transparent Huge Pages
+DefaultDependencies=no
+After=sysinit.target local-fs.target
+Before=basic.target
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+[Install]
+WantedBy=basic.target
+EOF
+systemctl daemon-reload && systemctl enable --now disable-thp.service
+# VERIFY: cat /sys/kernel/mm/transparent_hugepage/enabled -> "always madvise [never]"
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| Transparent Huge Pages | **`never`** | unset (`madvise`/`always`) | **⚠️ required by MongoDB and Redis** (they log a startup warning); THP's background `khugepaged` compaction causes multi-ms allocation stalls and RSS bloat under DB access patterns. PostgreSQL prefers THP off **plus** *static* `HugePages` (`huge_pages=on`, see §10). ClickHouse wants `madvise` (see §13) — the one exception, set there. |
+
+### 9.3 File-descriptor & process limits (ulimits)
+
+Two independent surfaces — **login sessions** (`limits.conf` via PAM) and **systemd
+services** (which ignore `limits.conf` entirely and need their own directives):
+
+```bash
+# PRODUCTION — login-session limits.
+cat > /etc/security/limits.d/90-nexus.conf <<'EOF'
+*   soft  nofile  65536
+*   hard  nofile  1048576
+*   soft  nproc   32768
+*   hard  nproc   65536
+*   soft  memlock unlimited
+*   hard  memlock unlimited
+EOF
+
+# systemd services DO NOT read limits.conf — set per-service (or a global default):
+cat > /etc/systemd/system.conf.d/90-nexus-limits.conf <<'EOF'
+[Manager]
+DefaultLimitNOFILE=65536:1048576
+DefaultLimitNPROC=32768:65536
+DefaultLimitMEMLOCK=infinity
+EOF
+systemctl daemon-reexec
+# VERIFY (a running engine): cat /proc/$(pgrep -n mongod)/limits | grep 'open files'
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `nofile` (open files) | soft `65536` / hard `1048576` | per-service `LimitNOFILE` only (e.g. Mongo `64000`, PXC `1048576`) | A DB with thousands of connections + data files hits the default `1024` soft limit → `Too many open files` / refused connections. The lab sets it *only* on the few services that would crash without it; production sets it fleet-wide. |
+| `nproc` | soft `32768` / hard `65536` | unset | Thread-heavy engines (Java: StarRocks/Kafka/Spark; PG backends) exhaust the default per-user process/thread cap under load. |
+| `memlock` | `unlimited` | unset | Required to `mlock` memory: static HugePages (PG), Redis `no-swap`, and any engine pinning RAM. Without it `mlockall` fails and the engine falls back or refuses to start. |
+| `DefaultLimit*` (systemd) | as above | unset | **The #1 ulimit gotcha:** raising `limits.conf` does nothing for a `systemctl`-started engine. It must come from the unit (`LimitNOFILE=…`) or this global `system.conf.d` default. |
+
+### 9.4 Storage — I/O scheduler & readahead
+
+```bash
+# PRODUCTION — deadline scheduler for SSD/NVMe; low readahead for random DB I/O.
+cat > /etc/udev/rules.d/60-nexus-scheduler.rules <<'EOF'
+ACTION=="add|change", KERNEL=="sd[a-z]",          ATTR{queue/scheduler}="mq-deadline", ATTR{queue/read_ahead_kb}="128"
+ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none",        ATTR{queue/read_ahead_kb}="128"
+EOF
+udevadm control --reload && udevadm trigger
+# VERIFY: cat /sys/block/sda/queue/scheduler -> "[mq-deadline]"
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| I/O scheduler | `mq-deadline` (SATA/SAS SSD) / `none` (NVMe) | unset (distro default) | `none`/deadline avoid the CFQ/BFQ fairness overhead that hurts a single dominant DB workload; NVMe is fast enough that queueing in the kernel only adds latency. |
+| `read_ahead_kb` | `128` | unset (`128`–`256`) | **MongoDB/Postgres recommend low readahead** for random-access workloads — large readahead wastes bandwidth pulling pages you won't use. Bump it back up (`4096`) only for scan-heavy OLAP (ClickHouse/StarRocks) on sequential storage. |
+| Filesystem | **XFS** for MongoDB/large-file engines; ext4 fine elsewhere | ext4 (lab default) | MongoDB explicitly recommends XFS (WiredTiger + XFS avoids ext4 stall pathologies at high write concurrency). |
+
+### 9.5 journald & time
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| journald `SystemMaxUse` | `500M` (`/etc/systemd/journald.conf.d/`) | unset (grows to 10% of `/`) | Caps the journal so a chatty engine can't fill the root FS; pair with persistent storage if you rely on it. |
+| chrony time sync | already configured | **PRESENT** (§B.3.5) | The lab already ships chrony pointed at the gateway — correct time is a hard requirement for TLS, Kerberos/AD, and Raft/Paxos clocks, so this one is *not* deferred. |
+
+> **Per-engine guides build on this.** Guides 07–22 §9 assume a host tuned as above and
+> then add only what's engine-specific: Redis needs `overcommit_memory=1` + THP off (both
+> here); MongoDB needs THP off + XFS + low readahead (here) plus WiredTiger cache sizing
+> (its §9); StarRocks needs `vm.max_map_count=262144` (here) plus BE `mem_limit` (its §9);
+> ClickHouse overrides THP to `madvise` (its §9). Set the OS layer once, per this guide.
+
+---
+
 ### Cross-references
 
 - **Network canon:** `nexus-platform-plan/docs/infra/network.md`

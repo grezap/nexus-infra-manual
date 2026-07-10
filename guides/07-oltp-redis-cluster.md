@@ -377,6 +377,104 @@ then re-run §5.3–5.4.
 
 ---
 
+## 9. Production tuning — Redis
+
+> **Everything below is *beyond the lab replica*.** The §5.3.1 `redis.conf` is the
+> verbatim lab config — it deliberately sets **no** `maxmemory`, leaves
+> persistence/threads/defrag at their defaults, and runs on 2 GB / 2-vCPU VMs where the
+> defaults are correct and keep the guide a faithful 1:1 replay. This section is what you
+> would change on a **production** Redis Cluster node and *why*. **Do not paste these onto
+> the 2 GB lab VMs blindly** — the memory and thread values assume production-sized hosts.
+> The **OS layer** (kernel `sysctl`, THP, ulimits, I/O scheduler) lives once in
+> **[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)**;
+> only the Redis-specific overrides are restated here.
+
+### 9.1 Memory — `maxmemory`, eviction policy, client buffers
+
+The single most important production knob Redis omits by default: an in-memory store with
+no cap grows until the kernel OOM-killer reaps it. Cap it **below** RAM, because a
+`BGSAVE`/`BGREWRITEAOF` `fork()` can transiently copy-on-write a large fraction of the
+dataset and roughly double RSS.
+
+```
+# PRODUCTION redis.conf — memory management (not applied in the lab).
+maxmemory 1400mb             # ~70% of a 2 GB node; size to YOUR host's RAM
+maxmemory-policy noeviction  # data store: never silently drop keys
+maxmemory-clients 5%         # cap client output/query buffers to a fraction of maxmemory
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `maxmemory` (redis.conf) | `~60–70% of node RAM` (leave headroom for the COW fork + OS page cache) | unset (**no cap**) | Uncapped, Redis grows until the OOM-killer kills the process (data loss + failover); a save-time fork can double RSS, so the cap must sit well below total RAM. |
+| `maxmemory-policy` (redis.conf) | **`noeviction`** for a data store / `allkeys-lru` for a pure cache | unset (`noeviction` default) | This cluster is the OLTP **data store**, so `noeviction` (writes return an OOM error at the cap; nothing is silently deleted) is the correct choice. A pure cache would use `allkeys-lru` to shed cold keys. Picking `allkeys-lru` on a data store = silent, unrecoverable data loss. |
+| `maxmemory-clients` (redis.conf) | `5%` of `maxmemory` (or an absolute `256mb`) | unset (`0` = unlimited) | Bounds per-client output + query buffers; a slow consumer or a huge pipeline can otherwise push the node past `maxmemory` and trigger eviction/OOM even though the keyspace fits. |
+
+### 9.2 Persistence — RDB snapshots + AOF fsync
+
+The lab already runs AOF (`appendonly yes`). Production decisions are the **fsync
+cadence** (durability vs. latency) and whether to keep RDB snapshots alongside AOF for
+fast restarts and point-in-time backups.
+
+```
+# PRODUCTION redis.conf — persistence (not applied in the lab).
+appendonly yes               # already set in §5.3.1
+appendfsync everysec         # <=1 s loss window on crash; use "always" only for zero-loss
+save 900 1
+save 300 10
+save 60 10000                # RDB alongside AOF: fast restarts + point-in-time backups
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `appendonly` (redis.conf) | `yes` | **`yes` (§5.3.1)** | AOF is already on in the lab — every write is logged; this is the durability backbone Redis restarts from. |
+| `appendfsync` (redis.conf) | `everysec` (default) — `always` only when a single ack'd write may **never** be lost | unset (`everysec`) | `everysec` fsyncs the AOF once per second: at most ~1 s of writes lost on a crash, negligible latency. `always` fsyncs on **every** write — durable, but adds disk-fsync latency to every command (10–100× slower on spinning/loaded disks). |
+| `save` (redis.conf) | the default triple `900 1` / `300 10` / `60 10000`, or explicit points | unset (built-in defaults apply) | RDB point-in-time snapshots for fast cold-restart and backups; with AOF also on, restart replays the RDB preamble then the AOF tail. `save ""` disables RDB entirely (AOF-only) — a deliberate, not accidental, choice. |
+
+### 9.3 OS layer — memory overcommit + THP  ⚠️
+
+Two OS knobs are Redis **requirements**, not optimisations — Redis logs a startup warning
+if either is wrong. Both are set once in **[Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier)**; restated here because they are Redis-driven.
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `vm.overcommit_memory` (sysctl) | `1` | unset (`0`) | **⚠️ required by Redis.** `BGSAVE`/`BGREWRITEAOF` `fork()` relies on the kernel permitting a COW overcommit; with `0` the fork's worst-case reservation is refused and the **background save fails** (leaving you with a stale RDB/AOF). Set in Guide 00 §9.1. |
+| Transparent Huge Pages | **`never`** | unset (`madvise`/`always`) | **⚠️ required by Redis.** During a save fork the parent's COW page copies interact badly with THP's `khugepaged`, producing multi-millisecond latency spikes and RSS inflation. Disable via the THP unit in Guide 00 §9.2. |
+
+### 9.4 Networking — listen backlog + keepalive
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `net.core.somaxconn` (sysctl) | `>= 1024` (e.g. `4096`) | unset (kernel default `4096` on modern Debian) | The kernel accept-queue ceiling. `tcp-backlog` below is **silently clamped to this** — if you raise `tcp-backlog` above `somaxconn` the extra is discarded. Set in Guide 00 §9.1. |
+| `tcp-backlog` (redis.conf) | `511` (default); raise to `1024`+ for connect storms, but **must be ≤ `net.core.somaxconn`** | unset (`511`) | The listen backlog Redis requests. Under a burst of new connections a too-shallow backlog drops SYNs; raise it and `somaxconn` **together**. |
+| `tcp-keepalive` (redis.conf) | `300` (default) | unset (`300`) | Sends TCP keepalives so dead client sockets and half-open cluster-bus links are detected and reaped; `0` disables detection and leaks connections/FDs over time. |
+
+### 9.5 Performance — I/O threads, active defrag, lazy freeing
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `io-threads` (redis.conf) | `2–4` on hosts with **> 4 cores** (never exceed core count); keep `1` on ≤ 4 cores | unset (`1`) | Offloads socket read/write to worker threads — a win **only** when the network stack is the bottleneck on a many-core box. On the 2-vCPU lab nodes it would add contention, so it stays at `1`. |
+| `activedefrag` (redis.conf) | `yes` | unset (`no`) | Online allocator (jemalloc) defragmenter; on long-running nodes with heavy key churn, external fragmentation makes RSS creep up over weeks even under a stable keyspace. Active-defrag reclaims it without a restart. |
+| `lazyfree-lazy-eviction` / `-expire` / `-server-del` / `replica-lazy-flush` (redis.conf) | `yes` (all) | unset (`no`) | Frees large keys in a **background** thread instead of inline on the main event loop. A synchronous `DEL`/eviction/expiry of a multi-GB key otherwise blocks **every** client for the whole free — a classic latency-spike source. |
+
+```
+# PRODUCTION redis.conf — performance (not applied in the lab).
+io-threads 4                 # ONLY on > 4-core hosts; leave 1 on the 2-vCPU lab nodes
+activedefrag yes
+lazyfree-lazy-eviction yes
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+replica-lazy-flush yes
+```
+
+### 9.6 Replication + cluster
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `repl-backlog-size` (redis.conf) | `128mb–512mb` (size ≈ peak write throughput × longest expected replica disconnect) | unset (`1mb`) | The circular buffer backing **partial** resync. If a replica is disconnected longer than the backlog spans, it must do a **full** RDB resync (expensive fork + full transfer). Size it so brief network blips resync partially instead. |
+| `cluster-node-timeout` (redis.conf) | `5000`–`15000` ms | **`5000` (§5.3.1)** | Already set in the lab. The window before a node is judged failed and failover begins — too low causes spurious failovers on transient latency, too high slows real failover. `5000` is a sound production baseline; raise it on high-latency/WAN links. |
+
+---
+
 ### Cross-references
 
 - **Network canon:** `nexus-platform-plan/docs/infra/network.md` (Redis `.81`–`.89` decade)

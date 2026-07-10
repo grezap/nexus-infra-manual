@@ -712,6 +712,32 @@ for ip in 149 150; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable --no
 
 ---
 
+## 9. Production tuning — Nessie catalog + Iceberg-PG
+
+> **Everything below is *beyond the lab replica*** — the lab runs Nessie + its catalog PG
+> lab-scale on 2 GB nodes; §5 is unchanged. Two engines here:
+>
+> 1. **The catalog PostgreSQL** (`iceberg-pg-1/2`) is a PG 17 streaming pair — its memory,
+>    checkpoint, WAL and OS tuning is **[Guide 10 §9](./10-oltp-patroni-postgresql-ha.md)**
+>    (apply the same `shared_buffers`/`effective_cache_size`/`work_mem`/`huge_pages` layer;
+>    it is plain streaming replication here, not Patroni, so set params in `postgresql.conf`
+>    directly rather than via `patronictl`). OS layer → [Guide 00 §9](./00-lab-host-and-base-vm.md).
+> 2. **Nessie** is a Quarkus/JVM app — its knobs are below.
+
+### 9.1 Nessie — JVM heap + Quarkus pools
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `JAVA_OPTS -Xmx`/`-Xms` (systemd unit) | `-Xmx2g` … `4g`, `-Xms==-Xmx`, `-XX:+UseG1GC` | default (unbounded → 25% RAM) | Bounds + pre-touches the catalog heap; an unbounded default under GC pressure stalls REST commits. Nessie is metadata-only, so a few GB is plenty. |
+| `quarkus.datasource.jdbc.max-size` | sized to concurrent writers (e.g. `20`–`50`) | default (`20`) | The JDBC pool from Nessie to the catalog PG; too small serialises concurrent Iceberg commits behind pool waits. |
+| `quarkus.thread-pool.max-threads` | = cores × a small factor | default | Quarkus worker threads serving the REST API; caps concurrent catalog operations. |
+| `quarkus.http.limits.max-body-size` | raise if large table metadata | default (`10M`) | Very wide Iceberg snapshots/manifests can exceed the default request body cap. |
+
+> The catalog PG carries the real durability + performance load — size it first (Guide 10 §9);
+> Nessie itself is light. OS layer for both roles → [Guide 00 §9](./00-lab-host-and-base-vm.md).
+
+---
+
 ### Cross-references
 
 - **0.L.2 architecture:** memory `project_nexus_infra_lakehouse_phase`; ADR-0034

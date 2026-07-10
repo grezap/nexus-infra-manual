@@ -514,6 +514,87 @@ for ip in 37 38 39; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable --n
 
 ---
 
+## 9. Production tuning — StarRocks 3.5 (shared-data)
+
+> **Everything below is *beyond the lab replica*.** §5 ships the verbatim lab configs — 5
+> VMs at 2 GB, FE heap `2g`, CN `storage_root_path` a bare local dir. This section adds
+> only the **shared-data-specific** knobs; it never alters §5. **Do not paste these onto
+> the 2 GB lab VMs blindly.**
+
+**Shared-data inherits Guide 14 §9 wholesale for the FE and OS layers** — the FE is
+identical (same JVM, same catalog role) and the OS host is the same Debian baseline. Rather
+than repeat them, read **[Guide 14 §9](./14-analytics-starrocks-shared-nothing.md#9-production-tuning--starrocks-35-shared-nothing)** for:
+
+- ⚠️ **`vm.max_map_count = 262144`** — the same **hard requirement**: a StarRocks CN mmaps
+  files exactly like a BE and will crash-loop / refuse to start at the kernel default
+  (`65530`). Set it on **every CN host** before first start. (Fleet-wide via
+  [Guide 00 §9](./00-lab-host-and-base-vm.md#9-production-tuning--the-os-layer-feeds-every-linux-tier).)
+- **FE heap** (`-Xmx ≥ 8g`, `-Xms == -Xmx`), **`query_timeout`**, and the OS layer
+  (swappiness, THP `never`, ulimits, I/O scheduler).
+- **`nofile 655350`** — already PRESENT in the CN systemd unit (§5.1.2), same as the SN BE.
+
+What follows is **only** what shared-data adds or changes over that baseline.
+
+### 9.1 CN — memory (`cn.conf`) replaces the BE's `mem_limit`
+
+The shared-data compute node (CN) is the stateless data plane — it plays the BE's role but
+holds **no durable data** (durability is MinIO's job). Its memory knob is the same
+`mem_limit`, in `cn.conf`, and the same rule applies: the lab leaves it at the default 90%
+because each CN owns its VM; set it **explicit** the moment a CN co-locates or the
+hypervisor over-commits, or the CN over-plans and gets OOM-killed.
+
+```bash
+# PRODUCTION — append to /opt/starrocks/be/conf/cn.conf on each CN (.30/.40).
+mem_limit = 80%              # or an absolute e.g. 48G when co-located
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| CN `mem_limit` (`cn.conf`) | **explicit** — `80%` or an absolute when co-located | unset (default `90%` of RAM) | Sizes the CN's query + **data-cache** memory. Left at 90% on a shared box the CN over-commits and is OOM-killed mid-query — same failure mode as the SN BE, different config file. |
+
+### 9.2 CN — the local disk **data cache** (the key shared-data perf knob)
+
+This is what makes or breaks shared-data performance. Every tablet read pulls bytes from
+**MinIO over the network**; without a warm local cache, every query re-fetches from object
+storage and pays S3 latency on each scan. The CN keeps a **local disk data cache** of
+MinIO-backed tablets — sizing it to hold the hot working set is *the* single highest-impact
+shared-data tuning decision. In the lab the cache rides the tiny default under
+`storage_root_path` (§5.2.1); in production you give it a large, dedicated **SSD/NVMe**
+path and an explicit byte budget.
+
+```bash
+# PRODUCTION — append to /opt/starrocks/be/conf/cn.conf on each CN.
+datacache_enable = true
+# Absolute on-disk cache budget for MinIO-backed tablets (size to the hot working set):
+starlet_star_cache_disk_size_bytes = 214748364800     # 200 GiB
+# Point the cache at a dedicated fast disk (defaults to storage_root_path otherwise):
+storage_root_path = /mnt/nvme/starrocks-cache,medium:SSD
+```
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `datacache_enable` (`cn.conf`) | **`true`** | unset (default) | Turns on the local disk cache of remote tablets. Off (or tiny), **every** query re-reads from MinIO over the network → S3-latency-bound scans and hammered object storage. |
+| `starlet_star_cache_disk_size_bytes` | size to the **hot working set** on fast disk (e.g. `200 GiB`+) | unset (small default under `storage_root_path`) | The cache's on-disk byte budget. Too small → constant eviction + re-fetch (cache thrash); generous on NVMe → most reads served locally at memory-ish latency. **The #1 shared-data perf lever.** |
+| CN cache disk (`storage_root_path`, `,medium:SSD`) | a **dedicated SSD/NVMe** path, medium-tagged | shared local dir, untagged (§5.2.1) | The cache is only as fast as its disk; put it on NVMe, separate from the OS disk, and tag the medium so placement is correct. |
+
+### 9.3 Cloud-native compaction & cache warmup
+
+Shared-data compaction runs against object storage (**`lake_compaction`**), and a cold CN
+(fresh node, or after a restart) serves the first queries slowly until its cache fills —
+warming it deliberately avoids that first-query cliff.
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `lake_compaction_max_tasks` (`fe.conf`) | `-1` (auto) or an explicit cap sized to CN count | unset (default) | Bounds concurrent **cloud-native** compaction tasks across the CNs. Too low → version backlog on MinIO-backed tables (`too many versions`); unbounded on few CNs → compaction starves queries. |
+| `lake_compaction_score_selector_min_score` (`fe.conf`) | tune to trigger compaction earlier under heavy write | unset (default) | The write-amplification threshold that schedules a tablet for compaction; lower it on write-heavy tables so small-file buildup is merged before it hurts reads. |
+| **Cache warmup** — `CACHE SELECT` / warm on load | pre-warm hot tables after a CN restart or add | not done (lab is cold-query) | A freshly-(re)started CN has an empty data cache, so the first scans are MinIO-latency-bound; issuing warmup reads (or `CACHE SELECT` on hot tables) fills the cache ahead of user queries, removing the cold-start cliff. |
+
+> **Everything else comes from Guide 14 §9** — FE heap/GC, `query_timeout`, `default`
+> replication semantics (N/A here — durability is MinIO's, so shared-data tables take no
+> `replication_num`), and the whole OS layer. Set those first, then this section on top.
+
+---
+
 ### Cross-references
 
 - **0.L.5 architecture:** memory `project_nexus_infra_analytics_phase` + `project_nexus_infra_lakehouse_phase`; ADR-0037 (StarRocks shared-data over MinIO)

@@ -627,6 +627,84 @@ for ip in 202 203 204; do ssh nexusadmin@192.168.70.$ip 'sudo systemctl disable 
 
 ---
 
+## 9. Production tuning — Citus on PostgreSQL
+
+> **Everything below is *beyond the lab replica*.** The §5 configs run coordinator + workers
+> at lab-scale on 2 GB VMs with default Citus sizing (`shard_count` unset → `32`,
+> `shard_replication_factor` unset → `1`) — enough to prove distribution + HA, not to serve a
+> real sharded workload. This section is what you would change for **production**, and *why*.
+> **Do not paste these onto the 2 GB lab VMs blindly.**
+
+### 9.1 The base PostgreSQL layer — tune it via Patroni
+
+Citus **is** PostgreSQL 17 + Patroni (the *same* stack as Guide 10, just three Patroni groups
+instead of one), so the base engine tuning — `shared_buffers`, `effective_cache_size`,
+`work_mem`, `maintenance_work_mem`, checkpoint/WAL, `max_connections` — is covered by
+**[Guide 10 §9](./10-oltp-patroni-postgresql-ha.md)** and the Guide 00 §9 OS layer (THP-off,
+`nofile`, `vm.overcommit_memory`, huge pages). This guide does not restate it.
+
+> **One difference in *how* you apply it:** these nodes are Patroni-managed, so PG parameters
+> go through **`patronictl edit-config`** (which writes them into the DCS and rolls them out),
+> **not** a hand-edited `postgresql.conf` — Patroni owns that file and will overwrite it. Edit
+> the `postgresql.parameters:` block (the §5.3.1 Patroni YAML already sets
+> `shared_preload_libraries`, `max_prepared_transactions`, `citus.node_conninfo` there):
+>
+> ```bash
+> # PRODUCTION — run on any node; Patroni propagates to all members of that scope.
+> sudo /usr/local/sbin/nexus-patronictl edit-config citus-coord \
+>   -s 'postgresql.parameters.shared_buffers=4GB' \
+>   -s 'postgresql.parameters.effective_cache_size=12GB'
+> # repeat for scopes citus-worker1 / citus-worker2 (workers get the larger share — see 9.3)
+> ```
+
+### 9.2 Citus distribution knobs (GUCs — set via `patronictl edit-config` or `ALTER SYSTEM`)
+
+| Setting | Production value | Lab value (§5) | Why it matters |
+|---|---|---|---|
+| `citus.shard_count` | **2–4× total worker cores** (e.g. 8-core × 2 workers → `48`–`64`) | default `32`; §5.4 demo sets `SET citus.shard_count = 32` session-local | Fixes the shard grid at `create_distributed_table` time and **cannot be changed for an existing table** without a re-distribute. Too few shards → hot workers + no room to rebalance when you add nodes; too many → per-shard planning/connection overhead. Size to cores so shards spread evenly and leave headroom for scale-out. |
+| `citus.shard_replication_factor` | `1` (rely on **Patroni streaming HA** per group) | default `1` (unset) | With per-worker-group Patroni (this lab's design), each shard is already HA via streaming replication — so `1` is correct. Raise to `2` **only** if you use Citus statement-based shard replication *instead* of streaming HA (this lab does not). Leave at `1` here. |
+| `citus.max_adaptive_executor_pool_size` | `16`–`32` per worker (bounded by worker cores) | default `16` | Max connections the coordinator opens **per worker** for one distributed query. Higher = more intra-query parallelism, but multiplied across concurrent queries it can exhaust worker `max_connections`. Balance against 9.3. |
+| `citus.max_shared_pool_size` | ≈ worker `max_connections` − headroom (e.g. `max_connections=200` → `160`) | default (follows `max_connections`) | **Global** cap on coordinator→worker connections across *all* queries — the guard that stops a query storm from exhausting every worker's connection slots. Set it explicitly below worker `max_connections` so PG always keeps slots for replication/admin. |
+| `citus.node_conninfo` | `sslmode=verify-full …` | **PRESENT** — `sslmode=verify-full` + ca/cert/key (§5.3.1, line 415) | The coordinator↔worker libpq TLS string. The lab already ships full mutual-TLS verification; noted so it's not mistaken for a gap. Production keeps `verify-full`. |
+| `max_prepared_transactions` | `≥ max_connections` (e.g. `200`+) | **PRESENT** — `100` (§5.3.1, line 414) | Citus uses 2PC for cross-shard writes, so this **must** be non-zero (a hard Citus requirement, already satisfied). Raise it in step with `max_connections` under high write concurrency, or distributed writes fail with `maximum number of prepared transactions reached`. |
+| `citus.enable_repartition_joins` | `on` | default `off` | Lets Citus execute joins **not** aligned on the distribution column by repartitioning shards on the fly. Essential for ad-hoc analytical joins across differently-sharded tables; off means those joins error (`complex joins are only supported…`). Costs network/IO, so enable knowingly. |
+
+```sql
+-- PRODUCTION — on the coordinator leader (also settable via patronictl edit-config so it
+-- survives failover). Not applied in the lab.
+ALTER SYSTEM SET citus.max_adaptive_executor_pool_size = 24;
+ALTER SYSTEM SET citus.max_shared_pool_size            = 160;
+ALTER SYSTEM SET citus.enable_repartition_joins        = on;
+SELECT pg_reload_conf();
+-- shard_count is per-table at creation, not a reloadable GUC for existing tables:
+-- SET citus.shard_count = 64; CREATE TABLE events (...) ... ; SELECT create_distributed_table('events','tenant_id');
+```
+
+### 9.3 Coordinator vs. worker sizing — they are not the same shape
+
+Citus's two roles have **opposite** resource profiles; size their VMs and PG params
+accordingly rather than cloning one config across all six nodes:
+
+| Dimension | Coordinator (`citus-coord-1/2`, VIP `.211`) | Workers (`citus-worker1/2-*`, VIPs `.212/.213`) |
+|---|---|---|
+| Primary pressure | **Connection + planning heavy** — terminates every client connection, plans + routes distributed queries, runs 2PC coordination | **Memory + I/O heavy** — hold the actual shard data, execute the per-shard scans/joins/aggregates |
+| RAM / `shared_buffers` | Moderate — it stores *no* shard data; enough for the catalog + planner | **Large** — this is where `shared_buffers`/`effective_cache_size` matter; workers cache the real data pages |
+| `max_connections` | **High** — every app connection lands here; pair with a pooler (PgBouncer) in front | Moderate — sized to `citus.max_adaptive_executor_pool_size × concurrent-coordinator-queries` + headroom |
+| CPU | Planning + result merging | Parallel shard execution — more cores = more shards scanned at once |
+| Scale axis | Vertical (bigger box) + an HA standby; usually **1 active** coordinator | **Horizontal** — add worker groups + `rebalance_table_shards()` to grow |
+
+> **Rule of thumb:** give workers the RAM/IO/cores and the big `shared_buffers`; give the
+> coordinator connection capacity + a front-end pooler. A coordinator starved of connections
+> bottlenecks the whole cluster; a worker starved of RAM turns every shard scan into disk I/O.
+
+### 9.4 OS layer
+
+All six Citus nodes are Debian PG hosts — apply **[Guide 00 §9](./00-lab-host-and-base-vm.md)**
+(THP-off, `vm.overcommit_memory=1`, `nofile`, huge pages for `shared_buffers`, low readahead)
+exactly as for the Guide 10 OLTP nodes, before the Citus knobs above.
+
+---
+
 ### Cross-references
 
 - **0.P architecture:** memory `project_nexus_infra_0p_phase`; ADR-0042 (Citus + full
