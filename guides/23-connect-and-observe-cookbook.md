@@ -290,6 +290,48 @@ Debezium reads SQL Server's CDC change tables — see them directly in **SSMS** 
 `SELECT * FROM OltpDb.cdc.dbo_Customers_CT ORDER BY __$start_lsn DESC;`. Full end-to-end walkthrough:
 [`dataflow-studio/docs/demos/watch-the-pipeline.md`](https://github.com/grezap/dataflow-studio/blob/main/docs/demos/watch-the-pipeline.md).
 
+## §11b · Schema Registry · ksqlDB · REST Proxy · MirrorMaker 2 · consumer lag
+
+The rest of the Kafka ecosystem (Guide 06) and how to watch it.
+
+**Schema Registry** (schema-registry-1/2 `192.168.70.91/92:8081`, HTTPS):
+```bash
+curl -sk https://192.168.70.91:8081/subjects                                         # all subjects
+curl -sk https://192.168.70.91:8081/subjects/dfs.customers.changed.v1-value/versions/latest
+curl -sk https://192.168.70.91:8081/config                                           # global compatibility
+```
+GUI: Conduktor / Redpanda Console include a Schema Registry browser.
+
+**ksqlDB** (ksqldb-1/2 `192.168.70.97/98:8088`) — streaming SQL. On the node:
+```bash
+sudo ksql --config-file /etc/nexus-ksqldb/ksql-cli.properties https://localhost:8088
+#   ksql> SHOW STREAMS;  SHOW TABLES;  PRINT 'oltp.OltpDb.dbo.Customers' FROM BEGINNING;
+```
+REST: `curl -sk https://192.168.70.97:8088/info` · `/ksql` (statements) · `/query-stream`.
+
+**REST Proxy** (kafka-rest-1 `192.168.70.88:8082`) — HTTP gateway to Kafka:
+```bash
+curl -sk https://192.168.70.88:8082/topics
+curl -sk https://192.168.70.88:8082/topics/oltp.OltpDb.dbo.Customers
+```
+
+**MirrorMaker 2** (mm2-1 east→west `.85`, mm2-2 west→east `.86`) — cross-cluster DR. Watch the process
+log + the mirrored topics on the DR cluster:
+```bash
+ssh …@192.168.70.85 'sudo journalctl -u nexus-mm2 -f'
+# east topics appear as east.<topic> on kafka-west (bootstrap 192.168.10.24:9092):
+sudo /opt/kafka/bin/kafka-topics.sh --bootstrap-server 192.168.10.24:9092 \
+  --command-config /tmp/client.properties --list | grep '^east\.'
+```
+
+**Consumer groups + lag** (how far behind a consumer is — the key pipeline-health signal):
+```bash
+sudo /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server 192.168.10.21:9092 \
+  --command-config /tmp/client.properties --describe --all-groups     # LAG per partition
+```
+
+**kafka-west (DR cluster)** — same tools, bootstrap `192.168.10.24/25/26:9092`.
+
 ## §12 · Vitess (sharded MySQL) — **DataGrip (via `vtgate`)**
 
 - **Endpoint:** vtgate MySQL `192.168.70.194:15306` (also `.195`); keyspace `commerce`.
@@ -297,6 +339,7 @@ Debezium reads SQL Server's CDC change tables — see them directly in **SSMS** 
 - **GUI (DataGrip):** *New → MySQL* → Host `192.168.70.194` Port `15306` → user+pw → SSL. `SHOW VITESS_SHARDS;`
 - **CLI:** `mysql -h 192.168.70.194 -P 15306 -u <user> -p -e "SHOW VITESS_TABLETS"` · admin (on control
   node `.193`): `vtctldclient --server 192.168.10.193:15999 GetTablets`
+- **Web:** vtctld admin UI `http://192.168.70.193:15000` · VTOrc (auto-reparent) UI `http://192.168.70.193:16000`.
 
 ## §13 · Citus (sharded PostgreSQL) — **DataGrip (coordinator VIP)**
 
@@ -322,13 +365,18 @@ Debezium reads SQL Server's CDC change tables — see them directly in **SSMS** 
 - **GUI:** log in → **Explore** → **Prometheus** (`up`, `node_load1`), **Loki** (`{fleet="nexusplatform"}`),
   **Tempo** (traces). Dashboards under **Dashboards** — this is how you watch the whole fleet.
 - **CLI:** `curl -sk https://192.168.70.170:9090/api/v1/query?query=up` (Prometheus, on prom-1).
+- **Direct web UIs (bypass Grafana):** Prometheus `https://192.168.70.170:9090` (also `.171`) →
+  *Status → Targets* to see every scraped node; **Alertmanager** `https://192.168.70.170:9093` →
+  firing/silenced alerts.
 
 ## §16 · Lakehouse (MinIO · Spark · Iceberg) — **Web consoles**
 
 - **MinIO console:** `https://192.168.70.141:9001` (S3 API `:9000`; nodes minio-1..4 `.141–.144`). Login
   `vault kv get -field=root-user nexus/lakehouse/minio` / `-field=root-password`. Browse buckets
   (`warehouse`, `loki`, `tempo`, `harbor`, `starrocks`).
-- **Spark master UI:** `http://192.168.70.140:8080` (ZK-elected active; standby `.153`).
+- **Spark master UI:** `http://192.168.70.140:8080` (ZK-elected active; standby `.153`) — running apps,
+  workers, completed jobs. **Worker UIs:** `http://192.168.70.145:8081` (also `.146/.154`). The ZK
+  ensemble backing master HA is in §18.
 - **Iceberg/Nessie:** REST `https://192.168.70.147:19120` (also `.148`); catalog DB VIP `.151`.
 - **CLI (on a node):** `mc alias set lab https://192.168.10.141:9000 <ak> <sk>` then `mc ls lab/warehouse`.
 
@@ -341,6 +389,87 @@ Debezium reads SQL Server's CDC change tables — see them directly in **SSMS** 
 
 ---
 
+## §18 · Coordination layer — etcd · ZooKeeper · ClickHouse Keeper · Patroni · HAProxy
+
+The consensus / DCS / LB pieces the HA tiers stand on — normally invisible; here's how to look.
+
+**Patroni REST** (PG HA state; `:8008` on each PG node) — the clearest HA view:
+```bash
+curl -sk https://192.168.70.61:8008/cluster     # leader + replicas + replication lag (JSON)
+curl -sk https://192.168.70.61:8008/patroni      # this node's role/state
+```
+Citus uses the same on the coordinator/worker Patronis (`.205` / `.207` / `.209`).
+
+**HAProxy stats** (Patroni LB; browser): `https://192.168.70.67:8404` — basic-auth `admin` /
+`vault kv get -field=content nexus/oltp/patroni/haproxy-stats-password`. Shows which backend is UP (the leader).
+
+**etcd** (DCS for Patroni `.64–.66`, Citus `.202–.204`, Vitess `.190–.192`) — on an etcd node:
+```bash
+sudo etcdctl --endpoints=https://192.168.10.64:2379 \
+  --cacert=/etc/nexus-etcd/tls/ca.crt --cert=/etc/nexus-etcd/tls/server.crt --key=/etc/nexus-etcd/tls/server.key \
+  --user root:$(vault kv get -field=content nexus/oltp/patroni/etcd-root-password) \
+  endpoint status --write-out=table                 # leader, raft term, db size
+sudo etcdctl … get --prefix /service/nexus-pg        # Patroni's stored cluster state
+```
+
+**ClickHouse Keeper** (`.41/.42/.43:9181` — CH's RAFT, not ZooKeeper):
+```bash
+echo mntr | ncat --ssl 192.168.10.41 9181            # 4-letter-word metrics (leader/followers, znodes)
+# or from clickhouse-client:  SELECT * FROM system.zookeeper WHERE path = '/'
+```
+
+**ZooKeeper** (Spark master-HA ensemble `.155/.156/.157:2181`):
+```bash
+echo stat | ncat 192.168.10.155 2181                 # mode: leader/follower + client count
+echo mntr | ncat 192.168.10.155 2181
+```
+
+**StarRocks FE quorum:** `SHOW FRONTENDS\G` (§10). **Vitess topo:** the etcd above + `vtctldclient GetTablets`.
+
+## §19 · Cross-cutting — services, metrics, logs, and VIPs on any node
+
+**Is a service up? What's it logging?** (every Linux node)
+```bash
+ssh -i ~/.ssh/nexus_gateway_ed25519 nexusadmin@192.168.70.<X>
+sudo systemctl status <service>       # e.g. redis-server · mongod · clickhouse-server · patroni · connect-distributed
+sudo journalctl -u <service> -f       # live tail;  -n 200 --no-pager for the last 200 lines
+```
+Windows nodes (RDP): `Get-Service`, `Get-WinEvent -LogName Application -MaxEvents 50`; SQL via SSMS.
+
+**Per-node metrics** — every Linux node runs **node_exporter** `:9100`; ws2025 runs
+**windows_exporter** `:9182`:
+```bash
+curl -s http://192.168.70.<X>:9100/metrics | grep -E 'node_load1|node_memory_MemAvailable|node_filesystem_avail'
+```
+
+**The fleet lens = Grafana (§15).** Prometheus scrapes every node's exporter; **Vector** ships every
+node's journald + `/var/log` to **Loki**; apps push traces to **Tempo**. In Grafana → *Explore*:
+- metrics: `up{instance=~".*<node>.*"}`, `node_load1`
+- logs: `{fleet="nexusplatform", host="<node>"}`
+- traces: search by service / trace-id.
+
+**Which node holds a VRRP VIP?** Only the current MASTER has it bound — on the candidates:
+```bash
+ip -brief addr | grep <vip> ;  sudo journalctl -u keepalived -n 20
+```
+VIPs: `.50` percona · `.60` patroni · `.119` registry-db · `.151` iceberg-db · `.184` grafana ·
+`.185` grafana-db · `.211/.212/.213` citus coord/worker1/worker2.
+
+**Cert expiry on a node:** `sudo openssl x509 -enddate -noout -in /etc/nexus-<svc>/tls/*.crt`.
+
+## §20 · nexus-gateway — DNS · DHCP · NAT · NFS · iSCSI · NTP
+
+The gateway (`192.168.70.1`, SSH) underpins the whole lab (Guide 01). To inspect it:
+```bash
+ssh -i ~/.ssh/nexus_gateway_ed25519 nexusadmin@192.168.70.1
+sudo systemctl status dnsmasq                      # DNS + DHCP
+cat /var/lib/misc/dnsmasq.leases                   # current DHCP leases (MAC → IP → hostname)
+sudo nft list ruleset | less                       # NAT + firewall
+sudo exportfs -v ;  showmount -e 192.168.70.1      # NFS exports (Portainer state, analytics backups)
+sudo tgtadm --lld iscsi --op show --mode target    # iSCSI target (SQL FCI shared LUN)
+chronyc sources ;  chronyc clients                 # NTP
+```
+
 ## Appendix — tool ↔ tier quick map
 
 | Tool | Tiers |
@@ -351,7 +480,10 @@ Debezium reads SQL Server's CDC change tables — see them directly in **SSMS** 
 | **RedisInsight** | Redis (§4) |
 | **Offset Explorer / Conduktor** | Kafka (§11), Kafka Connect + Debezium (§11a) |
 | **Connect REST / Conduktor / Redpanda Console** | Kafka Connect + Debezium CDC connectors (§11a) |
-| **Web browser** | Vault (§1), Portainer/Consul/Nomad (§14), Grafana (§15), MinIO/Spark (§16), Harbor (§17) |
+| **Web browser** | Vault (§1), Portainer/Consul/Nomad (§14), Grafana + Prometheus + Alertmanager (§15), MinIO + Spark master/workers (§16), Harbor (§17), vtctld/VTOrc (§12), HAProxy stats (§18) |
+| **Schema Registry / ksqlDB / REST Proxy / MM2** | Kafka ecosystem (§11b) — Conduktor / Redpanda Console + REST + `ksql` |
 | **RSAT / ADUC** | Active Directory (§2) |
 | **SSH / RDP** | every node (§0.4–0.5) |
-| **CLI clients** | `sqlcmd`, `redis-cli`, `mongosh`, `mysql`, `psql`, `clickhouse-client`, `kafka-*.sh`, `vtctldclient`, `mc`, `vault` |
+| **systemctl · journalctl · node_exporter** | any node's services, logs, metrics (§19) |
+| **etcdctl · zkCli · keeper-client · Patroni REST** | coordination / DCS layer (§18) |
+| **CLI clients** | `sqlcmd`, `redis-cli`, `mongosh`, `mysql`, `psql`, `clickhouse-client`, `kafka-*.sh`, `kafka-consumer-groups.sh`, `vtctldclient`, `mc`, `vault`, `etcdctl`, `nft`, `chronyc` |
