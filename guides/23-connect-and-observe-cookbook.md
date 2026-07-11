@@ -222,6 +222,74 @@ known drift from the canonical `.10`/`.11` in `vms.yaml`.)*
 - **CLI (on a broker, `/tmp/client.properties` = SSL + PEM keystore):** `kafka-topics.sh --bootstrap-server 192.168.10.21:9092 --command-config /tmp/client.properties --list`
 - **Schema Registry:** `curl -sk https://192.168.70.91:8081/subjects` · **Connect:** `curl -sk https://192.168.70.95:8083/connectors`
 
+## §11a · Kafka Connect + Debezium (observe CDC connectors)
+
+Debezium runs as a **connector inside Kafka Connect** (kafka-connect-1/2 `192.168.70.95/96:8083`,
+HTTPS, **server-TLS only — `client.auth=none`**, so you read/write it with a plain `curl -sk`).
+There is no native Connect GUI in the lab; you observe Debezium three ways: the **REST API**, a **GUI
+that speaks the Connect API** (Conduktor / Redpanda Console), and by **consuming the topics** it writes.
+
+### Reach the API
+
+Windows `curl` + schannel mishandles the IP-SAN cert, so **SSH to a connect node and curl
+`localhost`** (or open the browser after trusting the CA, §0.2):
+
+```bash
+ssh -i ~/.ssh/nexus_gateway_ed25519 nexusadmin@192.168.70.95
+```
+
+### REST API — the exact calls
+
+| See | Command (on the node; or browse `https://192.168.70.95:8083/…`) |
+|---|---|
+| all connectors | `curl -sk https://localhost:8083/connectors` |
+| **connector + task health** | `curl -sk https://localhost:8083/connectors/oltp-cdc/status` → `"state":"RUNNING"` (or `FAILED` + a `trace`) |
+| its config | `curl -sk https://localhost:8083/connectors/oltp-cdc/config` |
+| topics it writes to | `curl -sk https://localhost:8083/connectors/oltp-cdc/topics` |
+| its tasks | `curl -sk https://localhost:8083/connectors/oltp-cdc/tasks` |
+| is Debezium loaded | `curl -sk https://localhost:8083/connector-plugins \| grep -o SqlServerConnector` |
+| pause / resume | `curl -sk -X PUT https://localhost:8083/connectors/oltp-cdc/pause` (or `/resume`) |
+| restart (+ tasks) | `curl -sk -X POST 'https://localhost:8083/connectors/oltp-cdc/restart?includeTasks=true'` |
+
+Pretty-print any of these with `| python3 -m json.tool` or `| jq`. **Live-tail** the worker log to
+watch snapshot → streaming and any errors as they happen:
+
+```bash
+sudo journalctl -u connect-distributed.service -f | grep -iE 'oltp-cdc|sqlserver|snapshot|streaming|ERROR'
+```
+
+### What Debezium is producing (consume the topics)
+
+From a broker node with the mTLS `/tmp/client.properties` (see §11):
+
+| Topic | What it is |
+|---|---|
+| `oltp.OltpDb.dbo.Customers` (+ the other `oltp.OltpDb.dbo.*`) | the **raw CDC events** — JSON envelope `{before, after, op, source}` |
+| `schemahistory.oltp` | Debezium's internal **schema history** (DDL) |
+| `oltp` | the connector's schema-change topic |
+
+```bash
+sudo /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server 192.168.10.21:9092 \
+  --consumer.config /tmp/client.properties --topic oltp.OltpDb.dbo.Customers --from-beginning
+```
+
+Insert a row in SSMS (§3) and watch it appear here within a few seconds — that's the CDC → Debezium
+→ Kafka hop, live.
+
+### GUI options (they speak the Connect REST API)
+
+- **Conduktor** — the *Kafka Connect* view: add a Connect cluster URL `https://192.168.70.95:8083`
+  (trust the CA) → see every connector, its status/config, and restart / pause buttons.
+- **Redpanda Console** (kowl) or **kafka-connect-ui** (lensesio) — web UIs that list connectors +
+  tasks and let you browse the produced topics + messages; run either as a container pointed at the
+  brokers + Connect (`:8083`) + Schema Registry (`:8081`).
+
+### The SQL side of CDC
+
+Debezium reads SQL Server's CDC change tables — see them directly in **SSMS** (§3):
+`SELECT * FROM OltpDb.cdc.dbo_Customers_CT ORDER BY __$start_lsn DESC;`. Full end-to-end walkthrough:
+[`dataflow-studio/docs/demos/watch-the-pipeline.md`](https://github.com/grezap/dataflow-studio/blob/main/docs/demos/watch-the-pipeline.md).
+
 ## §12 · Vitess (sharded MySQL) — **DataGrip (via `vtgate`)**
 
 - **Endpoint:** vtgate MySQL `192.168.70.194:15306` (also `.195`); keyspace `commerce`.
@@ -281,7 +349,8 @@ known drift from the canonical `.10`/`.11` in `vms.yaml`.)*
 | **DataGrip** | Percona (§7), Patroni (§8), ClickHouse (§9), StarRocks (§10), Vitess (§12), Citus (§13) |
 | **NoSQLBooster / Compass** | Mongo RS (§5), Mongo sharded (§6) |
 | **RedisInsight** | Redis (§4) |
-| **Offset Explorer / Conduktor** | Kafka (§11) |
+| **Offset Explorer / Conduktor** | Kafka (§11), Kafka Connect + Debezium (§11a) |
+| **Connect REST / Conduktor / Redpanda Console** | Kafka Connect + Debezium CDC connectors (§11a) |
 | **Web browser** | Vault (§1), Portainer/Consul/Nomad (§14), Grafana (§15), MinIO/Spark (§16), Harbor (§17) |
 | **RSAT / ADUC** | Active Directory (§2) |
 | **SSH / RDP** | every node (§0.4–0.5) |
