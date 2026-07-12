@@ -202,11 +202,21 @@ known drift from the canonical `.10`/`.11` in `vms.yaml`.)*
 - **GUI (DataGrip):** *New → ClickHouse* → Host `192.168.70.44` Port `8443` → user+pw → **SSL on**.
   Query `system.clusters`, then `analytics.*`.
 - **CLI (on a node):** `clickhouse-client --host 192.168.10.44 --port 9440 --secure --user admin --password <p> -q "SELECT * FROM system.clusters WHERE cluster='nexus_analytics'"`
+  (add `--accept-invalid-certificate` when connecting to `localhost`, whose name may not match the node leaf).
+- **⚠️ External HTTPS clients need root + INTERMEDIATE CA.** `~/.nexus/vault-ca-bundle.crt` is **root-only**,
+  and CH presents just its leaf (issued by the Intermediate CA) → chain = *PartialChain*. Build a combined
+  bundle: `cat ~/.nexus/vault-ca-bundle.crt <(vault read -field=certificate pki_int/cert/ca) > ca-chain.crt`
+  and trust that. **No client cert** is required on `:8443` (password auth over server-TLS; mTLS is not enforced).
+- **App schema:** `dataflow-studio` owns the **`analytics`** telemetry DB (`pipeline_events` [local + Distributed],
+  `pipeline_latency_by_hour` MV, `cdc_lag_seconds`, `error_events`) — migrated by its DbUp runner (ADR-0005).
 
 ## §10 · StarRocks — **DataGrip (MySQL protocol)**
 
 - **Endpoint:** FE MySQL `192.168.70.31:9030` (shared-nothing; shared-data FE `.37:9030`), HTTP `:8030`.
 - **Creds:** `root` `vault kv get -field=password nexus/analytics/starrocks/root-password`.
+  MySQL wire is **TLS-off** — clients must set `--skip-ssl` (mysql CLI) / `SslMode=None` (MySqlConnector).
+- **App schema:** `dataflow-studio` owns the **`dwh`** Kimball star (5 dims + 4 facts + `bridge_customer_seg`,
+  SCD2 on `dim_customer`/`dim_product`) + **`analytics`** serving (view `dim_customer_current`) — DbUp (ADR-0005).
 - **GUI (DataGrip):** *New → MySQL* → Host `192.168.70.31` Port `9030` → `root` + pw. Run
   `SHOW FRONTENDS; SHOW BACKENDS;`.
 - **CLI:** `mysql -h 192.168.70.31 -P 9030 -u root -p -e "SHOW BACKENDS\G"` · Web `http://192.168.70.31:8030`.
