@@ -280,10 +280,14 @@ From a broker node with the mTLS `/tmp/client.properties` (see §11):
 | `oltp` | the connector's schema-change topic |
 
 > **dataflow-studio pipeline tools:** `scripts/dfs-seed.ps1` seeds a representative order-flow dataset
-> into OltpDb; `scripts/dfs-curate.ps1` drains the raw CDC into the curated Avro topics; `scripts/
-> dfs-trace.ps1` follows one record across all faces. The curation consumer group is `dfs-curation*`
-> (Kafka ACL: group-prefix `dfs-curation` READ for `User:CN=localhost`, granted with `kafka-acls.sh
-> --command-config /etc/nexus-kafka/client-ssl.properties`).
+> into OltpDb; `scripts/dfs-curate.ps1` drains the raw CDC into the curated Avro topics;
+> `scripts/dfs-warehouse-sink.ps1` loads the StarRocks `dwh` Kimball star (SCD2 dims + facts) from the
+> curated topics; `scripts/dfs-trace.ps1` follows one record across all faces. The curation consumer
+> group is `dfs-curation*` (Kafka ACL: group-prefix `dfs-curation` READ for `User:CN=localhost`,
+> granted with `kafka-acls.sh --command-config /etc/nexus-kafka/client-ssl.properties`); the DWH sink
+> reuses that authorized group prefix. **Kafka client PEM from Vault:** extract with pwsh
+> `ConvertFrom-Json` + `Set-Content -NoNewline` (a `grep`/`sed` extraction of `vault -format=json`
+> silently yields empty files → the broker replies `tlsv13 alert certificate required`).
 
 ```bash
 sudo /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server 192.168.10.21:9092 \
