@@ -274,9 +274,16 @@ From a broker node with the mTLS `/tmp/client.properties` (see §11):
 
 | Topic | What it is |
 |---|---|
-| `oltp.OltpDb.dbo.Customers` (+ the other `oltp.OltpDb.dbo.*`) | the **raw CDC events** — JSON envelope `{before, after, op, source}` |
+| `oltp.OltpDb.dbo.*` (all 10 order-flow tables) | the **raw CDC events** — JSON envelope `{before, after, op, source}`. The `oltp-cdc` connector captures Customers, ProductCategories, Products, Warehouses, CustomerAddresses, Orders, OrderLines, Transactions, Shipments, ProductInventory (`decimal.handling.mode=string`, `time.precision.mode=connect`). |
+| `dfs.<entity>.changed.v1` (10 topics) | the **curated Avro** events produced by the dataflow-studio curation worker (`dfs.customers.changed.v1`, `dfs.orders.changed.v1`, …). Consumed by the StarRocks/ClickHouse sinks. |
 | `schemahistory.oltp` | Debezium's internal **schema history** (DDL) |
 | `oltp` | the connector's schema-change topic |
+
+> **dataflow-studio pipeline tools:** `scripts/dfs-seed.ps1` seeds a representative order-flow dataset
+> into OltpDb; `scripts/dfs-curate.ps1` drains the raw CDC into the curated Avro topics; `scripts/
+> dfs-trace.ps1` follows one record across all faces. The curation consumer group is `dfs-curation*`
+> (Kafka ACL: group-prefix `dfs-curation` READ for `User:CN=localhost`, granted with `kafka-acls.sh
+> --command-config /etc/nexus-kafka/client-ssl.properties`).
 
 ```bash
 sudo /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server 192.168.10.21:9092 \
