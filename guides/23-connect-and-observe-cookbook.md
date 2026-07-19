@@ -210,6 +210,49 @@ known drift from the canonical `.10`/`.11` in `vms.yaml`.)*
 - **App schema:** `dataflow-studio` owns the **`analytics`** telemetry DB (`pipeline_events` [local + Distributed],
   `pipeline_latency_by_hour` MV, `cdc_lag_seconds`, `error_events`) — migrated by its DbUp runner (ADR-0005).
 
+### §9.1 · ClickHouse as a **Kafka consumer** — native telemetry ingestion (dataflow-studio ADR-0008)
+
+Since dataflow-studio Session 3D the six data nodes are also **Kafka clients**: they consume the
+pipeline's own telemetry directly, with no .NET consumer on the path.
+
+- **What was added on each data node `.44–.49`:**
+  - `/etc/clickhouse-server/kafka/{client.crt,client.key,ca.crt}` — `root:clickhouse`, dir `0750`, files `0640`.
+    `ca.crt` is the **root-only** `vault-ca-bundle.crt` (the brokers send their full chain, so root alone
+    validates them — unlike CH's own HTTPS listener above, which needs root+intermediate).
+  - `/etc/clickhouse-server/config.d/kafka-telemetry.xml` — the `<kafka>` block
+    (`security_protocol=ssl` + the three paths). **TLS lives here, never in DDL.**
+  - Requires `sudo systemctl restart nexus-clickhouse-server` to take effect.
+- **Identity:** its own principal **`CN=clickhouse-telemetry`**, issued from the dedicated role
+  `pki_int/roles/kafka-clickhouse-client` (client-auth only, 168 h).
+  ⚠️ The shared `kafka-broker` role **cannot** issue this CN (`allow_any_name=false`) — and must not be
+  patched, since a partial `vault write` resets a role's other fields.
+  ```bash
+  vault write -format=json pki_int/issue/kafka-clickhouse-client common_name=clickhouse-telemetry ttl=168h
+  ```
+- **ACLs** (grant from a broker with `--command-config /etc/nexus-kafka/client-ssl.properties`):
+  topic-prefix `dfs.telemetry` **READ + DESCRIBE**; group-prefix `dfs-clickhouse` **READ**.
+- **Topics consumed:** `dfs.telemetry.pipeline_events` · `dfs.telemetry.cdc_lag` ·
+  `dfs.telemetry.error_events` (JSON / `JSONEachRow`, RF=3, 1 partition each).
+- **Objects:** three `Kafka`-engine source tables + three `MaterializedView`s
+  (`*_kafka` / `*_kafka_mv`) feeding `pipeline_events_local`, `cdc_lag_seconds`, `error_events`.
+  ```sql
+  SELECT name, engine FROM system.tables
+  WHERE database='analytics' AND (name LIKE '%_kafka' OR name LIKE '%_kafka_mv');
+  ```
+- **See the telemetry:**
+  ```sql
+  SELECT pipeline, stage, count(), round(avg(duration_ms),1) FROM analytics.pipeline_events GROUP BY pipeline, stage;
+  SELECT source, count(), round(min(lag_seconds),1), round(max(lag_seconds),1) FROM analytics.cdc_lag_seconds GROUP BY source;
+  -- the MV has no Distributed wrapper -> read it with cluster()
+  SELECT stage, countMerge(events_state) AS events,
+         round(quantilesMerge(0.5,0.95,0.99)(p_state)[1],1) AS p50
+  FROM cluster('nexus_analytics', analytics.pipeline_latency_by_hour) GROUP BY stage ORDER BY events DESC;
+  ```
+- **Troubleshooting:** if a `*_kafka` table ingests nothing, check
+  `sudo journalctl -u nexus-clickhouse-server | grep -i kafka` — an ACL/TLS problem shows up there, not
+  in the query. With one partition per topic only **one** node in each consumer group holds the
+  assignment; that is expected, and its rows replicate within the shard.
+
 ## §10 · StarRocks — **DataGrip (MySQL protocol)**
 
 - **Endpoint:** FE MySQL `192.168.70.31:9030` (shared-nothing; shared-data FE `.37:9030`), HTTP `:8030`.
@@ -275,7 +318,8 @@ From a broker node with the mTLS `/tmp/client.properties` (see §11):
 | Topic | What it is |
 |---|---|
 | `oltp.OltpDb.dbo.*` (all 10 order-flow tables) | the **raw CDC events** — JSON envelope `{before, after, op, source}`. The `oltp-cdc` connector captures Customers, ProductCategories, Products, Warehouses, CustomerAddresses, Orders, OrderLines, Transactions, Shipments, ProductInventory (`decimal.handling.mode=string`, `time.precision.mode=connect`). |
-| `dfs.<entity>.changed.v1` (10 topics) | the **curated Avro** events produced by the dataflow-studio curation worker (`dfs.customers.changed.v1`, `dfs.orders.changed.v1`, …). Consumed by the StarRocks/ClickHouse sinks. |
+| `dfs.<entity>.changed.v1` (10 topics) | the **curated Avro** events produced by the dataflow-studio curation worker (`dfs.customers.changed.v1`, `dfs.orders.changed.v1`, …). Consumed by the StarRocks DWH sink. |
+| `dfs.telemetry.{pipeline_events,cdc_lag,error_events}` | the pipeline's **own telemetry** — **JSON, not Avro** (stage latency, CDC lag, structured errors). Consumed **natively by ClickHouse** via Kafka-engine tables, not by any .NET worker (see §9.1). |
 | `schemahistory.oltp` | Debezium's internal **schema history** (DDL) |
 | `oltp` | the connector's schema-change topic |
 
