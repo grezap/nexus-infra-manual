@@ -71,3 +71,18 @@ Guides 00–04 (host networks, gateway, AD, Vault HA, PKI) are the **base fleet*
 every later guide (DNS/NTP/apt via the gateway; cert issuance + secret reads via Vault; domain services via
 AD). In the running lab this is the 6-VM foundation base (gateway + 2 DCs' worth of AD + vault-1/2/3 +
 vault-transit) that stays up between sessions.
+
+## After the infrastructure — the application layer
+
+The dependency graph above ends at a *running platform*. What runs on it is documented in the same
+by-hand style, in each application repo rather than here (so the setup guide and the code it
+describes version together):
+
+- **dataflow-studio** — `docs/handbook.md` replays the whole CDC pipeline from zero, and
+  `docs/demos/watch-the-pipeline.md` walks the data hop by hop across six faces. It consumes Guides
+  **11** (SQL AG), **06** (Kafka), **14** (StarRocks) and **13** (ClickHouse) — all four must be
+  *alive*, per the rule above, not merely built.
+- **nexus-shared** — `docs/handbook.md` covers building, versioning and publishing the `Nexus.*`
+  package family the application projects consume. Needs no lab VMs.
+
+See [`INDEX.md`](./INDEX.md) for the full table.

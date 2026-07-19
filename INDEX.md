@@ -50,6 +50,22 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 > must be *running* (not just built) when you start a guide — is in
 > [`OVERVIEW.md`](./OVERVIEW.md).
 
+## Where the trail continues — the application layer
+
+These 23 guides cover the **infrastructure** (host networking → PostgreSQL sharding). They stop where
+the platform is ready to *run something*. The by-hand replay of what runs **on** it lives with each
+application project, in the same step-by-step spirit:
+
+| Project | By-hand replay | Watch the data move |
+|---|---|---|
+| **dataflow-studio** (Phase 1 — CDC pipeline) | [`docs/handbook.md`](https://github.com/grezap/dataflow-studio/blob/main/docs/handbook.md) — §0 prerequisites (exact creds + which tier per step) → migrate → CDC/Debezium → seed → ACLs → curate → StarRocks sink → ClickHouse telemetry → verify → tear down, with a transient ledger | [`watch-the-pipeline.md`](https://github.com/grezap/dataflow-studio/blob/main/docs/demos/watch-the-pipeline.md) — six faces, SSMS + Kafka console + DataGrip + `clickhouse-client` |
+| **nexus-shared** (0.J — the `Nexus.*` NuGet family) | [`docs/handbook.md`](https://github.com/grezap/nexus-shared/blob/main/docs/handbook.md) — build → version → publish to GitHub Packages → consume downstream | — |
+| **nexus-cli** | its own handbook + demo catalogue | — |
+
+Guides that the application layer leans on most directly: **11** (SQL Server FCI+AG — the OLTP
+source), **06** (Kafka — the transport), **13** (ClickHouse — telemetry, incl. §9.1 *ClickHouse as a
+Kafka consumer*), **14** (StarRocks — the warehouse).
+
 ## How we work
 
 - **One guide per session.** Each session produces one complete, self-reviewed guide
