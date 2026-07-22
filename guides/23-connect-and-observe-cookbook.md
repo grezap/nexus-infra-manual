@@ -45,6 +45,9 @@ $env:VAULT_TOKEN  = (Get-Content "$HOME\.nexus\vault-init.json" -Raw | ConvertFr
 | **Vitess** `root` | `nexus/vitess/mysql-root-password` | `content` | `vault kv get -field=content nexus/vitess/mysql-root-password` |
 | Vitess app | `nexus/vitess/mysql-app-password` | `content` | `vault kv get -field=content nexus/vitess/mysql-app-password` |
 | **Harbor** admin | `nexus/registry/harbor-admin` | `value` | `vault kv get -field=value nexus/registry/harbor-admin` |
+| **Marquez** DB (`marquez`) | `nexus/platform-tools/marquez/db-password` | `value` | `vault kv get -field=value nexus/platform-tools/marquez/db-password` |
+| Marquez PG replication | `nexus/platform-tools/marquez/replication-password` | `value` | `vault kv get -field=value nexus/platform-tools/marquez/replication-password` |
+| Marquez PG superuser (`postgres`) | `nexus/platform-tools/marquez/superuser-password` | `value` | `vault kv get -field=value nexus/platform-tools/marquez/superuser-password` |
 | **Portainer** admin | `nexus/portainer/admin-bcrypt` | `plaintext` | `vault kv get -field=plaintext nexus/portainer/admin-bcrypt` |
 | **Consul** mgmt token | `nexus/swarm/consul-bootstrap-token` | `management_token` | `vault kv get -field=management_token nexus/swarm/consul-bootstrap-token` |
 | **Nomad** mgmt token | `nexus/swarm/nomad-bootstrap-token` | `management_token` | `vault kv get -field=management_token nexus/swarm/nomad-bootstrap-token` |
@@ -115,7 +118,8 @@ known drift from the canonical `.10`/`.11` in `vms.yaml`.)*
 | **Lakehouse** | minio-1/2/3/4 `.141/.142/.143/.144` · spark-master-1/2 `.140/.153` · spark-worker-1/2/3 `.145/.146/.154` · zookeeper-1/2/3 `.155/.156/.157` · iceberg-rest-1/2 `.147/.148` · iceberg-pg-1/2 `.149/.150` | L |
 | **Registry** | registry-1/2 `.115/.116` · registry-pg-1/2 `.117/.118` | L |
 | **Workstation** | nexusdesk-dev `.160` | W |
-| **Platform-tools** *(reserved, not built)* | prefect-server `.125` · unleash-1 `.126` · marquez `.127` · backstage `.128` | L |
+| **Platform-tools (Marquez)** | marquez `.127` · marquez-pg-1/2 `.134/.135` (VIP marquez-db `.136`) | L |
+| **Platform-tools** *(reserved, not built)* | prefect-server `.125` · unleash-1 `.126` · backstage `.128` | L |
 
 ---
 
@@ -452,6 +456,45 @@ sudo /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server 192.168.10.21:90
 - **GUI:** log in → **Projects** → a project → **Repositories** (images, Trivy scans, cosign signatures).
 - **CLI:** `docker login registry.nexus.lab -u admin` then `docker pull registry.nexus.lab/<proj>/<img>:<tag>`.
 
+## §17a · Marquez (OpenLineage lineage) — **Web UI + REST** (0.Q.1)
+
+The platform's **OpenLineage** backend (Phase 0.Q.1, ADR-0043): a Marquez app node (`marquez` `.127`,
+Docker CE + docker-compose) behind an nginx TLS terminator, backed by a **dedicated PG 17 HA pair**
+(marquez-pg-1/2 `.134/.135`) with a keepalived VRRP VIP `marquez-db.nexus.lab` `.136` that Marquez
+reaches `sslmode=verify-full`. It answers *"if I change `raw.orders`, what breaks downstream?"*
+
+- **Endpoint (web UI):** `https://marquez.nexus.lab` — nginx `:443` → web `:3000`, api `:5000`, admin `:5001`.
+  From the WORKGROUP build host, browse by name via a `hosts` entry (`192.168.70.127 marquez.nexus.lab`)
+  or point VMnet11 DNS at the gateway (§0.3); the front-door leaf carries the `marquez.nexus.lab` SAN.
+- **Creds:** the API is unauthenticated on the lab; the **datastore** login is
+  `vault kv get -field=value nexus/platform-tools/marquez/db-password` (user `marquez`, db `marquez`).
+- **GUI — the lineage graph (browser):** open `https://marquez.nexus.lab` → pick namespace
+  `nexus-lineage-demo` (or `nexus-lineage`) → the graph view shows jobs (`curate-orders`, `load-dwh`) and
+  datasets (`raw.orders` → `curated.orders` → `dwh.fact_order`) with the edges between them.
+- **GUI — the datastore (DataGrip):** *New → PostgreSQL* → Host `192.168.70.136` (VIP) Port `5432` →
+  user `marquez` + pw (above) → SSL, **Mode `verify-full`** (CA = the lab bundle) → database `marquez`.
+- **CLI — see the data (REST read model, SSH-local-curl on `.127`):**
+  ```bash
+  ssh -i ~/.ssh/nexus_gateway_ed25519 nexusadmin@192.168.70.127
+  CA=/etc/ssl/certs/platform-tools-ca.pem ; R='--resolve marquez.nexus.lab:443:192.168.70.127'
+  curl -sS --cacert $CA $R https://marquez.nexus.lab/api/v1/namespaces
+  curl -sS --cacert $CA $R https://marquez.nexus.lab/api/v1/namespaces/nexus-lineage-demo/jobs
+  curl -sS --cacert $CA $R https://marquez.nexus.lab/api/v1/namespaces/nexus-lineage-demo/datasets
+  # downstream impact from a dataset:
+  curl -sS --cacert $CA $R 'https://marquez.nexus.lab/api/v1/lineage?nodeId=dataset:nexus-lineage-demo:raw.orders&depth=10'
+  ```
+- **CLI — emit a run graph:** POST OpenLineage events to `POST /api/v1/lineage` (an OpenLineage client,
+  or dataflow-studio/Prefect/Spark with `OPENLINEAGE_URL=https://marquez.nexus.lab`). The committed
+  end-to-end data-flow demo is
+  [`nexus-infra-platform-tools/scripts/marquez-lineage-demo.ps1`](https://github.com/grezap/nexus-infra-platform-tools/blob/main/scripts/marquez-lineage-demo.ps1)
+  (emits the 2-job / 3-dataset graph, every POST `201`, then reads it back).
+- **CLI — the datastore (psql):** `sudo -u postgres psql -h /var/run/postgresql -d marquez` on `.134`,
+  then inspect the lineage tables (`\dt`, e.g. `SELECT name FROM jobs;` · `SELECT name FROM datasets;`).
+- **Observe:** on `.127` — `docker compose -f /etc/nexus-marquez/docker-compose.yml ps` (api/web/nginx Up)
+  and `docker compose … logs -f marquez` (ingest activity). On `.134` — PG streaming replication
+  `sudo -u postgres psql -d marquez -c 'SELECT state,sync_state FROM pg_stat_replication'` → `streaming`.
+  VIP holder (either PG node): `ip -brief addr | grep 136`.
+
 ---
 
 ## §18 · Coordination layer — etcd · ZooKeeper · ClickHouse Keeper · Patroni · HAProxy
@@ -517,8 +560,8 @@ node's journald + `/var/log` to **Loki**; apps push traces to **Tempo**. In Graf
 ```bash
 ip -brief addr | grep <vip> ;  sudo journalctl -u keepalived -n 20
 ```
-VIPs: `.50` percona · `.60` patroni · `.119` registry-db · `.151` iceberg-db · `.184` grafana ·
-`.185` grafana-db · `.211/.212/.213` citus coord/worker1/worker2.
+VIPs: `.50` percona · `.60` patroni · `.119` registry-db · `.136` marquez-db · `.151` iceberg-db ·
+`.184` grafana · `.185` grafana-db · `.211/.212/.213` citus coord/worker1/worker2.
 
 **Cert expiry on a node:** `sudo openssl x509 -enddate -noout -in /etc/nexus-<svc>/tls/*.crt`.
 
@@ -540,12 +583,13 @@ chronyc sources ;  chronyc clients                 # NTP
 | Tool | Tiers |
 |---|---|
 | **SSMS** | SQL Server AG (§3) |
-| **DataGrip** | Percona (§7), Patroni (§8), ClickHouse (§9), StarRocks (§10), Vitess (§12), Citus (§13) |
+| **DataGrip** | Percona (§7), Patroni (§8), ClickHouse (§9), StarRocks (§10), Vitess (§12), Citus (§13), Marquez datastore (§17a) |
 | **NoSQLBooster / Compass** | Mongo RS (§5), Mongo sharded (§6) |
 | **RedisInsight** | Redis (§4) |
 | **Offset Explorer / Conduktor** | Kafka (§11), Kafka Connect + Debezium (§11a) |
 | **Connect REST / Conduktor / Redpanda Console** | Kafka Connect + Debezium CDC connectors (§11a) |
-| **Web browser** | Vault (§1), Portainer/Consul/Nomad (§14), Grafana + Prometheus + Alertmanager (§15), MinIO + Spark master/workers (§16), Harbor (§17), vtctld/VTOrc (§12), HAProxy stats (§18) |
+| **Web browser** | Vault (§1), Portainer/Consul/Nomad (§14), Grafana + Prometheus + Alertmanager (§15), MinIO + Spark master/workers (§16), Harbor (§17), Marquez lineage graph (§17a), vtctld/VTOrc (§12), HAProxy stats (§18) |
+| **curl / OpenLineage client** | Marquez lineage REST — emit run events + read the graph (§17a) |
 | **Schema Registry / ksqlDB / REST Proxy / MM2** | Kafka ecosystem (§11b) — Conduktor / Redpanda Console + REST + `ksql` |
 | **RSAT / ADUC** | Active Directory (§2) |
 | **SSH / RDP** | every node (§0.4–0.5) |

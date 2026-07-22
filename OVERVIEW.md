@@ -9,7 +9,9 @@ order is **16 before 15** (called out below).
 Fidelity note: this is a 1:1 by-hand replay of the automated `nexus-infra-*` repos. The
 canonical topology (node names, IPs, MACs, counts) lives in
 [`nexus-platform-plan/docs/infra/vms.yaml`](https://github.com/grezap/nexus-platform-plan/blob/main/docs/infra/vms.yaml)
-(`metadata.vm_count = 140`). If a guide and vms.yaml ever disagree, vms.yaml wins.
+(`metadata.vm_count = 143` — the 23 by-hand guides build 140 VMs; the +3 delta is the Marquez
+platform-tools tier (Phase 0.Q.1, ADR-0043), deployed by automation and covered in Guide 23 rather than
+a numbered by-hand build guide). If a guide and vms.yaml ever disagree, vms.yaml wins.
 
 ## Tier order (top = built first)
 
