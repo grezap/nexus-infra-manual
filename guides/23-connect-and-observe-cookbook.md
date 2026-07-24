@@ -284,6 +284,31 @@ emit **counter** over OTLP to the Phase-0.I collector; each run's OTel trace id 
     'https://127.0.0.1:9090/api/v1/query?query=dfs_telemetry_emitted_records_total'
   ```
 
+### §9.3 · DataFlow Studio OpenLineage → Marquez (data lineage) (dataflow-studio ADR-0011, E16)
+
+The curation + warehouse-sink runs POST OpenLineage run events to **Marquez** (Phase 0.Q), so the
+`oltp.* → dfs.* → dwh.*` dataset graph is queryable — the "if I change this source, what breaks
+downstream?" view. Each run's OpenLineage runId is its OTel trace id, so a run is the same entity as its
+Tempo trace (§9.2) and its ClickHouse `pipeline_events` (§9.1).
+
+- **Run it:** `dataflow-studio/scripts/dfs-lineage-demo.ps1` (`-SkipWarehouseSink` for the raw→curated leg only).
+- **Endpoint:** `DFS_MARQUEZ_ENDPOINT=https://192.168.70.127` — the **Marquez** nginx TLS front door
+  (`marquez` `.127`; the emitter appends `/api/v1/lineage`). Use the **IP** from a WORKGROUP host (the
+  leaf carries an IP SAN; `marquez.nexus.lab` won't resolve). **Server-TLS only, no client cert.**
+- **Trust:** `DFS_MARQUEZ_CACERT=~/.nexus/vault-ca-bundle.crt` (the NexusPlatform **root**; the front door
+  serves its own intermediate, so the root completes the chain).
+- **Read the graph back** (SSH-local-curl on the marquez node; the `/etc/nexus-marquez/tls/ca.crt` is
+  root-only, so use the world-readable copy):
+  ```bash
+  CA=/etc/ssl/certs/platform-tools-ca.pem
+  CURL="curl -sS --cacert $CA --resolve marquez.nexus.lab:443:127.0.0.1"; API=https://marquez.nexus.lab/api/v1
+  $CURL "$API/namespaces/dataflow-studio/jobs"     | grep -o '"name":"[^"]*"' | sort -u   # curation, warehouse-sink
+  $CURL "$API/lineage?nodeId=dataset:dataflow-studio:oltp.OltpDb.dbo.Customers&depth=10"   # downstream graph
+  ```
+- **Browser:** `https://192.168.70.127` (namespace `dataflow-studio`) — 2 jobs + 29 datasets.
+- **Gotcha:** if `:443` times out right after power-on, the marquez VM was **suspended** (not stopped) —
+  the containers are stale + Docker's DNAT is gone; `sudo systemctl restart docker` on `.127` fixes it.
+
 ## §10 · StarRocks — **DataGrip (MySQL protocol)**
 
 - **Endpoint:** FE MySQL `192.168.70.31:9030` (shared-nothing; shared-data FE `.37:9030`), HTTP `:8030`.
