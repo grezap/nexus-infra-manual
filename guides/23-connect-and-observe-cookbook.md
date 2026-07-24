@@ -257,6 +257,33 @@ pipeline's own telemetry directly, with no .NET consumer on the path.
   in the query. With one partition per topic only **one** node in each consumer group holds the
   assignment; that is expected, and its rows replicate within the shard.
 
+### §9.2 · DataFlow Studio OTLP → Tempo (traces) + Prometheus (metrics) (dataflow-studio ADR-0010, E16)
+
+Same pipeline, seen as OpenTelemetry. The curation + warehouse-sink engines export **spans** and the
+emit **counter** over OTLP to the Phase-0.I collector; each run's OTel trace id equals the ClickHouse
+`pipeline_events.trace_id`, so §9.1 and this section are the **same run** two ways.
+
+- **Run it:** `dataflow-studio/scripts/dfs-otel-demo.ps1` (curation; `-IncludeWarehouseSink` adds the DWH load).
+- **Endpoint:** `DFS_OTLP_ENDPOINT=https://192.168.70.182:4318` — the **OTel collector** HTTP/protobuf
+  receiver (`otel-collector-1/2` `.182`/`.183`, RR-DNS `otel.nexus.lab`; use the **IP** from a WORKGROUP
+  host — the leaf has an IP SAN, `otel.nexus.lab` won't resolve). **Server-TLS only, no client cert.**
+- **Trust:** `DFS_OTLP_CACERT=~/.nexus/vault-ca-bundle.crt` (the NexusPlatform **root**; the collector
+  serves its own intermediate, so the root alone completes the chain).
+- **Traces (Tempo):** Grafana (`https://192.168.70.184:3000`, admin / `nexus/observability/grafana` field
+  `admin-password`) → Explore → Tempo → Service Name `dfs-curation`. Or SSH-local on a tempo node:
+  ```bash
+  sudo curl -s --cacert /etc/nexus-tempo/tls/ca.crt \
+    'https://127.0.0.1:3200/api/search?q=%7B%20resource.service.name%3D%22dfs-curation%22%20%7D&limit=5'
+  ```
+- **Metrics (Prometheus):** `dfs_telemetry_emitted_records_total` (by `stream`). **Query BOTH proms**
+  (`.170` + `.171`): the collector RR-DNS-writes to one of two independent Prometheus instances, so a
+  remote-written metric lands on one node. Prometheus must run with `--web.enable-remote-write-receiver`
+  (enabled on `prom-1/2` 2026-07-24; baked into the obs Packer image).
+  ```bash
+  sudo curl -s --cacert /etc/nexus-prometheus/tls/ca.crt \
+    'https://127.0.0.1:9090/api/v1/query?query=dfs_telemetry_emitted_records_total'
+  ```
+
 ## §10 · StarRocks — **DataGrip (MySQL protocol)**
 
 - **Endpoint:** FE MySQL `192.168.70.31:9030` (shared-nothing; shared-data FE `.37:9030`), HTTP `:8030`.
