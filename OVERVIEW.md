@@ -1,17 +1,17 @@
 # nexus-infra-manual — Build order & dependency graph
 
-A single-page map of how the 23 by-hand guides ([`INDEX.md`](./INDEX.md)) fit together:
+A single-page map of how the 24 by-hand guides ([`INDEX.md`](./INDEX.md)) fit together:
 the **tier build order**, the **cross-guide dependencies**, and — critically — which
 prerequisite tiers must be **alive (powered on)**, not merely *built*, when you start a
-guide. Work the guides top-to-bottom (00 → 22); the only edge that runs against the numeric
-order is **16 before 15** (called out below).
+guide. Work the guides top-to-bottom (00 → 22, then 24); the only edge that runs against the
+numeric order is **16 before 15** (called out below).
 
 Fidelity note: this is a 1:1 by-hand replay of the automated `nexus-infra-*` repos. The
 canonical topology (node names, IPs, MACs, counts) lives in
 [`nexus-platform-plan/docs/infra/vms.yaml`](https://github.com/grezap/nexus-platform-plan/blob/main/docs/infra/vms.yaml)
-(`metadata.vm_count = 143` — the 23 by-hand guides build 140 VMs; the +3 delta is the Marquez
-platform-tools tier (Phase 0.Q.1, ADR-0043), deployed by automation and covered in Guide 23 rather than
-a numbered by-hand build guide). If a guide and vms.yaml ever disagree, vms.yaml wins.
+(`metadata.vm_count = 143` — the 24 by-hand build guides build all 143 VMs; the Marquez platform-tools
+tier (Phase 0.Q.1, ADR-0043; 3 VMs + the `.136` VIP) is **Guide 24**). If a guide and vms.yaml ever
+disagree, vms.yaml wins.
 
 ## Tier order (top = built first)
 

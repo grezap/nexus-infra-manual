@@ -32,8 +32,9 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 | 21 | ✅ [Sharding · Vitess (MySQL)](./guides/21-sharding-vitess-mysql.md) | 3 etcd topo + vtctld/VTOrc + 2 vtgate + 2 shards × 3 Percona 8.4 tablets; hash-vindex sharding, full mTLS, VTOrc auto-reparent, **engine-native `file` BackupStorage** (0.O.1) | 12 | deb13 | `nexus-infra-vitess` |
 | 22 | ✅ [Sharding · Citus (PostgreSQL)](./guides/22-sharding-citus-postgresql.md) | 3 etcd DCS + coordinator Patroni pair + 2 worker Patroni pairs + 3 keepalived VIPs (VIP-follows-leader); 32-shard distributed table, full mTLS | 9 | deb13 | `nexus-infra-citus` |
 | 23 | ✅ [Connect & Observe Cookbook](./guides/23-connect-and-observe-cookbook.md) | **Cross-tier reference** (not a build guide): how to connect to every tier and *see the data* — the right GUI tool per engine (SSMS · DataGrip · NoSQLBooster · RedisInsight · Offset Explorer · web consoles) **+** the CLI equivalent, with endpoints + Vault credential paths | — | — | all tiers |
+| 24 | ✅ [Platform tools · Marquez (OpenLineage)](./guides/24-platform-tools-marquez-openlineage.md) | Marquez OpenLineage **data-lineage** backend: Docker-compose app (API + web + **nginx TLS** front door) + a dedicated **PostgreSQL 17 HA pair** + **VRRP VIP** (`marquez-db.nexus.lab .136`); the platform-tools tier (`09-platform`), Phase 0.Q.1 | 3 | deb13 | `nexus-infra-platform-tools` |
 
-**Total: 23 build guides (00–22) · 140 VMs · the full infrastructure layer, by hand — ✅ ALL COMPLETE — plus the cross-tier Connect & Observe Cookbook (Guide 23).**
+**Total: 24 build guides (00–22 + 24) · 143 VMs · the full infrastructure + platform-tools layer, by hand — ✅ ALL COMPLETE — plus the cross-tier Connect & Observe Cookbook (Guide 23).**
 
 > 🛠 **Production-tuning layer (§9).** Guide 00 (the OS layer) and **every engine guide
 > (06–22)** each carry a **§9 Production tuning** section — the system variables a production operator
@@ -52,9 +53,10 @@ session-sized and self-contained (with a stated prerequisites section). Work the
 
 ## Where the trail continues — the application layer
 
-These 23 guides cover the **infrastructure** (host networking → PostgreSQL sharding). They stop where
-the platform is ready to *run something*. The by-hand replay of what runs **on** it lives with each
-application project, in the same step-by-step spirit:
+These 24 guides cover the **infrastructure + platform-tools** layer (host networking → PostgreSQL
+sharding → the Marquez lineage backend). They stop where the platform is ready to *run something*. The
+by-hand replay of what runs **on** it lives with each application project, in the same step-by-step
+spirit:
 
 | Project | By-hand replay | Watch the data move |
 |---|---|---|
@@ -69,7 +71,7 @@ Kafka consumer*), **14** (StarRocks — the warehouse).
 ## How we work
 
 - **One guide per session.** Each session produces one complete, self-reviewed guide
-  under `guides/NN-<slug>.md`, and flips its row above from 📋 → ✅. **All 23 are now ✅.**
+  under `guides/NN-<slug>.md`, and flips its row above from 📋 → ✅. **All 24 are now ✅.**
 - Every guide follows [`CONVENTIONS.md`](./CONVENTIONS.md) (the step-block format +
   global lab facts) so the format never drifts.
 - Commands + configs are sourced **verbatim from the automated repos** (the rendered

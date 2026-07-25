@@ -26,7 +26,7 @@ the VMware GUI, install the OS from the ISO, and configure every service by hand
 
 ## Start here
 
-- **[`INDEX.md`](./INDEX.md)** — the full roadmap: 23 guides, build-dependency order,
+- **[`INDEX.md`](./INDEX.md)** — the full roadmap: 24 guides, build-dependency order,
   with status. Read this first.
 - **[`CONVENTIONS.md`](./CONVENTIONS.md)** — the shared format every guide follows
   (the step-block shape, the global lab facts, the defaults) so you don't relearn it
@@ -54,15 +54,17 @@ these guides reproduce it exactly.
 
 ## Status
 
-**✅ COMPLETE — all 23 guides authored (see `INDEX.md`).**
+**✅ COMPLETE — all 24 guides authored (see `INDEX.md`).**
 Foundation (00–04), orchestration (05), Kafka (06), the full **OLTP tier**
 (07–12), the full **Analytics tier** (13–15: ClickHouse + StarRocks
 shared-nothing + StarRocks shared-data), the full **Lakehouse tier** (16: MinIO;
 17: Iceberg/Nessie + PG HA; 18: Spark HA + ZooKeeper), the **Registry** (19:
 Harbor HA), the **Observability** tier (20: Grafana LGTM — 14 nodes + 2 VRRP
-VIPs), and the two **Sharding** tiers (21: Vitess/MySQL; 22: Citus/PostgreSQL).
-The entire NexusPlatform infrastructure layer — host networking through database
-sharding — is now reproducible **entirely by hand**, one command at a time.
+VIPs), the two **Sharding** tiers (21: Vitess/MySQL; 22: Citus/PostgreSQL), and
+the **Platform-tools** tier (24: Marquez OpenLineage + PG HA — the E16 lineage
+backend). The entire NexusPlatform infrastructure + platform-tools layer — host
+networking through the lineage backend — is now reproducible **entirely by hand**,
+one command at a time.
 
 **Kept current (2026-07-10):** Guide 12 (sharded MongoDB) now documents the **0.N.1 wire
 mTLS** layer (`requireTLS` + per-host `mongo-sharded-server` Vault-PKI leaves); Guide 21
